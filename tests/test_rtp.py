@@ -42,11 +42,13 @@ def test_towers_rtp():
 
 
 def test_highlow_rtp():
+    # HighLow carries its own (larger) house edge, so its RTP target differs.
+    hl_target = 1 - highlow.HL_EPS
     for r in range(1, highlow.RANKS + 1):
         for direction in ("higher", "lower"):
             if not highlow.can_pick(direction, r):
                 continue
-            assert abs(_rtp(highlow.rtp_distribution(direction, r)) - TARGET) < TOL
+            assert abs(_rtp(highlow.rtp_distribution(direction, r)) - hl_target) < TOL
 
 
 def test_plinko_rtp():
