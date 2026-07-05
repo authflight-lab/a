@@ -594,6 +594,7 @@ async def game_cashout(name: str, user: dict = Depends(require_user), body: dict
 
     params = rnd.get("params") or {}
     state = rnd.get("outcome") or {}
+    ss, cs, nonce = rnd["server_seed"], rnd["client_seed"], int(rnd["nonce"])
     if name == "flip":
         streak = int(state.get("streak", 0))
         mult = flip.multiplier(streak)
@@ -602,7 +603,11 @@ async def game_cashout(name: str, user: dict = Depends(require_user), body: dict
         m = int(params["mines"])
         revealed = list(state.get("revealed", []))
         mult = mines.multiplier(len(revealed), m)
-        outcome = {"revealed": revealed, "mines_count": m, "multiplier": mult}
+        # server_seed is revealed to the client on cashout regardless, so the
+        # mine layout is already client-derivable — including it here lets the
+        # UI reveal the full board (no new information is disclosed).
+        mine_set = sorted(mines.mine_positions(ss, cs, nonce, m))
+        outcome = {"revealed": revealed, "mines_count": m, "multiplier": mult, "mines": mine_set}
     elif name == "towers":
         difficulty = str(params["difficulty"])
         floor = int(state.get("floor", 0))
