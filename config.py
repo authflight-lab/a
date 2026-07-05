@@ -16,8 +16,9 @@ from dataclasses import dataclass, fields
 class Settings:
     # Mirror of the bot token in bot/config.py — used ONLY for initData validation.
     bot_token: str = "8685205697:AAHMw11dVTkN0gW-hnvt5Igku5au6D5BlmQ"
-    bt_supabase_url: str = ""
-    bt_supabase_service_key: str = ""
+    # HARDCODED for testing (user request). Swap out later / move to env vars.
+    bt_supabase_url: str = "https://jbtakenwtinlipbgrujm.supabase.co"
+    bt_supabase_service_key: str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpidGFrZW53dGlubGlwYmdydWptIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MzI1MTg2OSwiZXhwIjoyMDk4ODI3ODY5fQ.CX-0-7wwTQFWpBMvvzyC8x8H9JRRMet-VbOWomK56Ro"
     bt_app_origin: str = ""
 
     def __post_init__(self) -> None:
