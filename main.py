@@ -351,7 +351,7 @@ def _initial_state(name: str, np: dict, ss: str, cs: str, nonce: int) -> dict:
     if name == "towers":
         return {"floor": 0, "difficulty": np["difficulty"]}
     if name == "highlow":
-        start = highlow.draw_card(rng_float(ss, cs, nonce, 0))
+        start = highlow.current_card(lambda i: rng_float(ss, cs, nonce, i), 0)
         return {"rank": start, "start_card": start, "step": 0, "multiplier": 1.0}
     return {}
 
@@ -562,23 +562,31 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
         return {"outcome_step": {"floor": floor, "col": col, "safe": True}, "multiplier": mult,
                 "can_cashout": True, "busted": False, "done": False}
 
-    # highlow
+    # highlow — the client sends the direction as {"guess": ...} (matching the
+    # other games' dict-shaped moves); accept a bare string too for robustness.
+    guess = move.get("guess") if isinstance(move, dict) else move
     r = int(state.get("rank", 0))
     step_n = int(state.get("step", 0))
     cur_mult = float(state.get("multiplier", 1.0))
-    if move not in ("higher", "lower") or not highlow.can_pick(move, r):
+    if (guess not in ("higher", "lower") or not highlow.can_pick(guess, r)
+            or not highlow.within_cap(cur_mult, guess, r)):
         return _err("invalid_move")
-    drawn = highlow.draw_card(rng_float(ss, cs, nonce, step_n + 1))
-    win = highlow.resolve(move, r, drawn)
+    draw = lambda i: rng_float(ss, cs, nonce, i)
+    slot = step_n + 1
+    drawn = highlow.reveal_card(draw, slot)  # revealed card (full 1..13 deck)
+    win = highlow.resolve(guess, r, drawn)
     if not win:
-        outcome = {"rank": r, "drawn": drawn, "guess": move, "step": step_n, "busted": True}
+        outcome = {"rank": r, "drawn": drawn, "guess": guess, "step": step_n, "busted": True}
         final = await _finalise(rnd, tg_id, 0.0, "settled", outcome)
-        return {"outcome_step": {"drawn": drawn, "prev": r, "guess": move, "win": False},
+        return {"outcome_step": {"drawn": drawn, "prev": r, "guess": guess, "win": False},
                 "multiplier": 0.0, "can_cashout": False, "busted": True, "done": True, **final}
-    new_mult = cur_mult * highlow.step_multiplier(move, r)
-    new_state = {"rank": drawn, "step": step_n + 1, "multiplier": new_mult}
+    new_mult = cur_mult * highlow.step_multiplier(guess, r)
+    # Wild reveal (Ace/King) passes through to the next non-wild card, which
+    # becomes the new current decision card; a normal card is itself the current.
+    new_rank = drawn if not highlow.is_wild(drawn) else highlow.current_card(draw, slot, start_j=1)
+    new_state = {"rank": new_rank, "step": step_n + 1, "multiplier": new_mult}
     await db.update_round(rnd["id"], {"outcome": new_state})
-    return {"outcome_step": {"drawn": drawn, "prev": r, "guess": move, "win": True},
+    return {"outcome_step": {"drawn": drawn, "current": new_rank, "prev": r, "guess": guess, "win": True},
             "multiplier": new_mult, "can_cashout": True, "busted": False, "done": False}
 
 
