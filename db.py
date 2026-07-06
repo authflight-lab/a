@@ -393,6 +393,13 @@ async def rotate_seed_pair(tg_id: int, client_seed: str,
 # Game rounds
 # ---------------------------------------------------------------------------
 
+async def get_stale_open_rounds(minutes: int = 30) -> list[dict]:
+    """Return all rounds that have been open for longer than ``minutes``."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+    return await _get("bt_game_rounds",
+                      {"status": "eq.open", "created_at": f"lt.{cutoff}", "select": "*", "limit": "200"})
+
+
 async def get_open_round(tg_id: int, game: str) -> dict | None:
     rows = await _get("bt_game_rounds",
                       {"tg_id": f"eq.{tg_id}", "game": f"eq.{game}", "status": "eq.open",

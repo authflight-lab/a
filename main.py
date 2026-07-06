@@ -12,6 +12,7 @@ Importing this module performs NO network I/O; Supabase is contacted lazily and,
 when unconfigured, endpoints return 503.
 """
 
+import asyncio
 import logging
 import math
 from collections import defaultdict
@@ -30,6 +31,92 @@ from .game import dice, flip, highlow, mines, plinko, seedpair, towers
 from .game.seed import rng_float
 
 app = FastAPI(title="Bartender API", version="1.0")
+
+# ---------------------------------------------------------------------------
+# Stale-round sweeper — background task that auto-cashouts rounds that were
+# left open (e.g. user closed Telegram mid-game). Runs every 5 minutes.
+# ---------------------------------------------------------------------------
+_STALE_MINUTES = 30          # rounds open longer than this are swept
+_SWEEP_INTERVAL_SEC = 300    # how often the sweeper checks
+
+logger = logging.getLogger(__name__)
+
+
+async def _sweep_stale_rounds() -> None:
+    """Find open rounds older than _STALE_MINUTES and settle them."""
+    try:
+        stale = await db.get_stale_open_rounds(_STALE_MINUTES)
+    except Exception as exc:
+        logger.warning("stale_sweep_db_error: %s", exc)
+        return
+
+    for rnd in stale:
+        try:
+            await _cashout_stale_round(rnd)
+        except Exception as exc:
+            logger.warning("stale_cashout_failed round=%s: %s", rnd.get("id"), exc)
+
+
+async def _cashout_stale_round(rnd: dict) -> None:
+    name = rnd.get("game", "")
+    tg_id = int(rnd["tg_id"])
+    params = rnd.get("params") or {}
+    state = rnd.get("outcome") or {}
+    ss, cs, nonce = rnd["server_seed"], rnd["client_seed"], int(rnd["nonce"])
+
+    try:
+        if name not in MULTI_STEP:
+            # Single-settle games (dice/plinko) that somehow stayed open: abandon.
+            await db.close_round(rnd["id"], {
+                "outcome": state, "payout": 0, "status": "abandoned",
+                "settled_at": db._now(),
+            })
+            return
+
+        if name == "flip":
+            streak = int(state.get("streak", 0))
+            mult = min(flip.multiplier(streak), MULT_CAP) if streak > 0 else 0.0
+            outcome = {"streak": streak, "multiplier": mult}
+        elif name == "mines":
+            revealed = list(state.get("revealed", []))
+            if not revealed:
+                mult, outcome = 0.0, {"revealed": [], "multiplier": 0.0}
+            else:
+                m = int(params.get("mines", 3))
+                mult = min(mines.multiplier(len(revealed), m), MULT_CAP)
+                mine_set = sorted(mines.mine_positions(ss, cs, nonce, m))
+                outcome = {"revealed": revealed, "mines_count": m, "multiplier": mult, "mines": mine_set}
+        elif name == "towers":
+            floor = int(state.get("floor", 0))
+            if floor <= 0:
+                mult, outcome = 0.0, {"floor": 0, "multiplier": 0.0}
+            else:
+                difficulty = str(params.get("difficulty", "medium"))
+                mult = min(towers.multiplier(floor, difficulty), MULT_CAP)
+                outcome = {"floor": floor, "difficulty": difficulty, "multiplier": mult}
+        else:  # highlow
+            step_n = int(state.get("step", 0))
+            if step_n == 0:
+                mult, outcome = 0.0, {"step": 0, "multiplier": 0.0}
+            else:
+                mult = min(float(state.get("multiplier", 1.0)), MULT_CAP)
+                outcome = {"step": step_n, "rank": int(state.get("rank", 0)), "multiplier": mult}
+    except Exception:
+        mult, outcome = 0.0, {}
+
+    await _finalise(rnd, tg_id, mult, "timed_out", outcome)
+    logger.info("stale_round_swept round=%s game=%s tg_id=%s mult=%s", rnd["id"], name, tg_id, mult)
+
+
+async def _stale_round_sweeper_loop() -> None:
+    while True:
+        await asyncio.sleep(_SWEEP_INTERVAL_SEC)
+        await _sweep_stale_rounds()
+
+
+@app.on_event("startup")
+async def _start_sweeper() -> None:
+    asyncio.create_task(_stale_round_sweeper_loop())
 
 logger = logging.getLogger("bt.api")
 
