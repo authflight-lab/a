@@ -8,11 +8,16 @@ helper used by the RTP identity test.
 Global constants (spec §6):
 - ``EPS``   house edge (1%). Every game derives its RTP from this single value.
 - ``P_MAX`` max payout per round (points).
+- ``MULT_CAP`` global ceiling on any round's win multiplier (economy guard).
 - ``BET_MIN`` / ``BET_MAX`` bet range is ``[BET_MIN, min(BET_MAX, balance)]``.
 """
 
 EPS = 0.01
-P_MAX = 5000
+P_MAX = 2000
+# Hard ceiling on any game's win multiplier, so an open-ended progression
+# (towers doubling, mines deep-clears, highlow chaining) can't balloon a single
+# round far beyond the point-earning economy. A capped step auto-cashes out.
+MULT_CAP = 25.0
 BET_MIN = 1
 BET_MAX = 350
 

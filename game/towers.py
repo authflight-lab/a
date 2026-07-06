@@ -15,6 +15,11 @@ pick, ``/cashout`` to lock. Trap hit -> settle with payout 0.
 from . import EPS
 from .seed import rng_int
 
+# Total floors in a tower. A full clear of the top floor auto-cashes out; the
+# global MULT_CAP may end a run earlier (notably on hard, which doubles each
+# floor and would otherwise reach ~253x at floor 8).
+FLOORS = 8
+
 DIFFICULTIES = {
     "easy": {"C": 4, "t": 1},
     "medium": {"C": 3, "t": 1},

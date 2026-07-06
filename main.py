@@ -26,7 +26,7 @@ from . import db, notify
 from .auth import require_user
 from .config import settings
 from .db import InsufficientBalance, SupabaseNotConfigured
-from .game import BET_MAX, BET_MIN, GAMES, MULTI_STEP, P_MAX, SINGLE_SETTLE
+from .game import BET_MAX, BET_MIN, GAMES, MULT_CAP, MULTI_STEP, P_MAX, SINGLE_SETTLE
 from .game import dice, flip, highlow, mines, plinko, towers
 from .game.seed import generate_server_seed, rng_float, server_hash
 
@@ -578,8 +578,11 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
                     "can_cashout": False, "busted": True, "done": True, **final}
         revealed.append(cell)
         k = len(revealed)
-        mult = mines.multiplier(k, m)
-        done = k == (mines.TOTAL - m)
+        raw = mines.multiplier(k, m)
+        mult = min(raw, MULT_CAP)
+        # Auto-cash on a full clear OR once the cap is reached, so a deep-clear
+        # tail can't chase a multiplier far beyond the economy.
+        done = k == (mines.TOTAL - m) or raw >= MULT_CAP
         new_state = {"revealed": revealed, "mines_count": m, "multiplier": mult}
         if done:
             outcome = {**new_state, "mines": sorted(mine_set), "cleared": True}
@@ -609,8 +612,17 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
             return {"outcome_step": {"floor": floor, "col": col, "safe": False}, "multiplier": 0.0,
                     "can_cashout": False, "busted": True, "done": True, **final}
         new_floor = floor + 1
-        mult = towers.multiplier(new_floor, difficulty)
+        raw = towers.multiplier(new_floor, difficulty)
+        mult = min(raw, MULT_CAP)
+        # Auto-cash on the top floor OR once the cap is reached, so hard's
+        # doubling ladder can't run away to ~253x at the top.
+        done = new_floor >= towers.FLOORS or raw >= MULT_CAP
         new_state = {"floor": new_floor, "difficulty": difficulty, "multiplier": mult}
+        if done:
+            outcome = {**new_state, "cleared": True}
+            final = await _finalise(rnd, tg_id, mult, "cashed_out", outcome)
+            return {"outcome_step": {"floor": floor, "col": col, "safe": True}, "multiplier": mult,
+                    "can_cashout": True, "busted": False, "done": True, **final}
         await db.update_round(rnd["id"], {"outcome": new_state})
         return {"outcome_step": {"floor": floor, "col": col, "safe": True}, "multiplier": mult,
                 "can_cashout": True, "busted": False, "done": False}
@@ -663,7 +675,7 @@ async def game_cashout(name: str, user: dict = Depends(require_user), body: dict
     elif name == "mines":
         m = int(params["mines"])
         revealed = list(state.get("revealed", []))
-        mult = mines.multiplier(len(revealed), m)
+        mult = min(mines.multiplier(len(revealed), m), MULT_CAP)
         # server_seed is revealed to the client on cashout regardless, so the
         # mine layout is already client-derivable — including it here lets the
         # UI reveal the full board (no new information is disclosed).
@@ -672,11 +684,11 @@ async def game_cashout(name: str, user: dict = Depends(require_user), body: dict
     elif name == "towers":
         difficulty = str(params["difficulty"])
         floor = int(state.get("floor", 0))
-        mult = towers.multiplier(floor, difficulty)
+        mult = min(towers.multiplier(floor, difficulty), MULT_CAP)
         outcome = {"floor": floor, "difficulty": difficulty, "multiplier": mult}
     else:  # highlow
         step_n = int(state.get("step", 0))
-        mult = float(state.get("multiplier", 1.0))
+        mult = min(float(state.get("multiplier", 1.0)), MULT_CAP)
         outcome = {"step": step_n, "rank": int(state.get("rank", 0)), "multiplier": mult}
 
     return await _finalise(rnd, tg_id, mult, "cashed_out", outcome)

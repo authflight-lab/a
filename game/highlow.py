@@ -20,6 +20,8 @@ Two guards keep payouts sane for a points economy:
   absurd payout; a step that would exceed it is not offered (cash out instead).
 """
 
+from . import MULT_CAP
+
 # HighLow-specific house edge (5%). Larger than the global EPS (1%) on purpose;
 # other games are unaffected.
 HL_EPS = 0.05
@@ -31,8 +33,9 @@ RANKS = 13
 STRIDE = 64
 
 # Hard ceiling on the chain multiplier (economy guard). A winning step that would
-# push the chain past this is not offered — the player cashes out instead.
-HL_MAX_MULT = 25.0
+# push the chain past this is not offered — the player cashes out instead. Shared
+# with every other game via the global MULT_CAP so no round can exceed it.
+HL_MAX_MULT = MULT_CAP
 
 
 def p_higher(r: int) -> float:
