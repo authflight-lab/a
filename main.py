@@ -14,7 +14,6 @@ when unconfigured, endpoints return 503.
 
 import logging
 import math
-import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -22,7 +21,7 @@ from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from . import db, notify
+from . import db, notify, ratelimit
 from .auth import require_user
 from .config import settings
 from .db import InsufficientBalance, SupabaseNotConfigured
@@ -43,6 +42,24 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["X-Telegram-Init-Data", "Content-Type"],
 )
+
+
+@app.middleware("http")
+async def _ip_rate_limit_middleware(request: Request, call_next):
+    """Pre-auth IP-level guard: 120 req / 60 s per IP across all /bt/api/ routes."""
+    if request.url.path.startswith("/bt/api/"):
+        xff = request.headers.get("X-Forwarded-For")
+        ip = xff.split(",")[0].strip() if xff else (
+            request.client.host if request.client else "unknown"
+        )
+        allowed, retry_after = ratelimit.check(f"ip:{ip}", limit=120, window_sec=60)
+        if not allowed:
+            return JSONResponse(
+                status_code=429,
+                content={"ok": False, "error": "rate_limited"},
+                headers={"Retry-After": str(retry_after)},
+            )
+    return await call_next(request)
 
 
 @app.exception_handler(SupabaseNotConfigured)
@@ -99,26 +116,17 @@ def _payout(bet: int, multiplier: float) -> int:
     return min(int(bet * multiplier), P_MAX)
 
 
-# --- simple in-memory rate limiting (spec §14: /claim, /game/*, /redeem) ---
-
-_rl_buckets: dict[str, list[float]] = defaultdict(list)
-
-
-def _rate_limit(key: str, limit: int, window_sec: float) -> bool:
-    """Return True if allowed, False if the limit is exceeded."""
-    now = time.time()
-    bucket = _rl_buckets[key]
-    cutoff = now - window_sec
-    while bucket and bucket[0] < cutoff:
-        bucket.pop(0)
-    if len(bucket) >= limit:
-        return False
-    bucket.append(now)
-    return True
-
-
 def _err(code: str, status: int = 400) -> JSONResponse:
     return JSONResponse(status_code=status, content={"ok": False, "error": code})
+
+
+def _rl_err(retry_after: int) -> JSONResponse:
+    """429 with Retry-After header so clients know when to retry."""
+    return JSONResponse(
+        status_code=429,
+        content={"ok": False, "error": "rate_limited"},
+        headers={"Retry-After": str(retry_after)},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +145,9 @@ async def health():
 @app.get("/bt/api/me")
 async def me(user: dict = Depends(require_user)):
     tg_id = user["tg_id"]
+    allowed, retry_after = ratelimit.check(f"me:{tg_id}", limit=60, window_sec=60)
+    if not allowed:
+        return _rl_err(retry_after)
     u = await db.get_user(tg_id)
     if u is None:
         u = await db.upsert_user(tg_id, user.get("username"), user.get("display_name")) or {}
@@ -161,8 +172,9 @@ async def me(user: dict = Depends(require_user)):
 @app.post("/bt/api/claim")
 async def claim(user: dict = Depends(require_user)):
     tg_id = user["tg_id"]
-    if not _rate_limit(f"claim:{tg_id}", limit=5, window_sec=60):
-        return _err("rate_limited", 429)
+    allowed, retry_after = ratelimit.check(f"claim:{tg_id}", limit=5, window_sec=60)
+    if not allowed:
+        return _rl_err(retry_after)
 
     u = await db.get_user(tg_id)
     if u is None:
@@ -210,6 +222,9 @@ async def claim(user: dict = Depends(require_user)):
 @app.post("/bt/api/age-ack")
 async def age_ack(user: dict = Depends(require_user)):
     tg_id = user["tg_id"]
+    allowed, retry_after = ratelimit.check(f"age_ack:{tg_id}", limit=5, window_sec=60)
+    if not allowed:
+        return _rl_err(retry_after)
     if await db.get_user(tg_id) is None:
         await db.upsert_user(tg_id, user.get("username"), user.get("display_name"))
     await db.set_age_ack(tg_id)
@@ -222,6 +237,10 @@ async def age_ack(user: dict = Depends(require_user)):
 
 @app.get("/bt/api/rewards")
 async def rewards(_user: dict = Depends(require_user)):
+    tg_id = _user["tg_id"]
+    allowed, retry_after = ratelimit.check(f"rewards:{tg_id}", limit=20, window_sec=60)
+    if not allowed:
+        return _rl_err(retry_after)
     period = _period()
     items = await db.list_rewards(active_only=True)
     out = []
@@ -251,8 +270,9 @@ async def redeem(user: dict = Depends(require_user), body: dict | None = Body(de
     reward_id = body.get("reward_id")
     if not reward_id:
         return _err("invalid_request")
-    if not _rate_limit(f"redeem:{tg_id}", limit=10, window_sec=60):
-        return _err("rate_limited", 429)
+    allowed, retry_after = ratelimit.check(f"redeem:{tg_id}", limit=10, window_sec=60)
+    if not allowed:
+        return _rl_err(retry_after)
 
     # Activity floor first (spec §5): today's chatted AND claimed (UTC).
     quest = await db.get_quest(tg_id, _today())
@@ -316,6 +336,9 @@ async def leaderboard(
     tab: str = "rich", period: str = "weekly", user: dict = Depends(require_user)
 ):
     tg_id = user["tg_id"]
+    allowed, retry_after = ratelimit.check(f"leaderboard:{tg_id}", limit=20, window_sec=60)
+    if not allowed:
+        return _rl_err(retry_after)
     if tab not in ("rich", "chatters"):
         return _err("invalid_tab")
     if period not in ("weekly", "alltime"):
@@ -360,6 +383,9 @@ async def leaderboard(
 @app.get("/bt/api/history")
 async def history(user: dict = Depends(require_user)):
     tg_id = user["tg_id"]
+    allowed, retry_after = ratelimit.check(f"history:{tg_id}", limit=20, window_sec=60)
+    if not allowed:
+        return _rl_err(retry_after)
     rows = await db.ledger_history(tg_id, limit=50)
     return {"rows": [
         {"id": r.get("id"), "amount": int(r.get("amount", 0)), "kind": r.get("kind"),
@@ -414,8 +440,9 @@ async def game_bet(name: str, user: dict = Depends(require_user), body: dict | N
     if name not in GAMES:
         return _err("unknown_game", 404)
     tg_id = user["tg_id"]
-    if not _rate_limit(f"game:{tg_id}", limit=60, window_sec=60):
-        return _err("rate_limited", 429)
+    allowed, retry_after = ratelimit.check(f"game:{tg_id}", limit=60, window_sec=60)
+    if not allowed:
+        return _rl_err(retry_after)
 
     body = body or {}
     try:
@@ -509,6 +536,9 @@ async def game_settle(name: str, user: dict = Depends(require_user), body: dict 
     if name not in SINGLE_SETTLE:
         return _err("invalid_action")
     tg_id = user["tg_id"]
+    allowed, retry_after = ratelimit.check(f"game:{tg_id}", limit=60, window_sec=60)
+    if not allowed:
+        return _rl_err(retry_after)
     body = body or {}
     rnd, err = await _load_open_round(name, tg_id, body.get("round_id"))
     if err:
@@ -530,6 +560,9 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
     if name not in MULTI_STEP:
         return _err("invalid_action")
     tg_id = user["tg_id"]
+    allowed, retry_after = ratelimit.check(f"game:{tg_id}", limit=60, window_sec=60)
+    if not allowed:
+        return _rl_err(retry_after)
     body = body or {}
     rnd, err = await _load_open_round(name, tg_id, body.get("round_id"))
     if err:
@@ -660,6 +693,9 @@ async def game_cashout(name: str, user: dict = Depends(require_user), body: dict
     if name not in MULTI_STEP:
         return _err("invalid_action")
     tg_id = user["tg_id"]
+    allowed, retry_after = ratelimit.check(f"game:{tg_id}", limit=60, window_sec=60)
+    if not allowed:
+        return _rl_err(retry_after)
     body = body or {}
     rnd, err = await _load_open_round(name, tg_id, body.get("round_id"))
     if err:
