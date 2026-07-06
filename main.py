@@ -370,12 +370,12 @@ async def leaderboard(
         rows, you = await _rows_from_totals(totals, tg_id)
         return {"tab": tab, "period": period, "rows": rows, "you": you}
 
-    # chatters: points earned with kind='chat'.
-    start = _week_start() if period == "weekly" else _EPOCH
-    ledger = await db.chatters_ledger(start)
+    # chatters: raw messages sent (ranked by message count, not points earned).
+    start_day = _week_start()[:10] if period == "weekly" else _EPOCH[:10]
+    counts = await db.chat_counts_since(start_day)
     totals = defaultdict(int)
-    for row in ledger:
-        totals[int(row["tg_id"])] += int(row["amount"])
+    for row in counts:
+        totals[int(row["tg_id"])] += int(row["count"])
     rows, you = await _rows_from_totals(totals, tg_id)
     return {"tab": tab, "period": period, "rows": rows, "you": you}
 

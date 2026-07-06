@@ -478,11 +478,13 @@ async def rich_rank(tg_id: int, balance: int) -> int:
     return (int(total) + 1) if total.isdigit() else 1
 
 
-async def chatters_ledger(period_start: str) -> list[dict]:
-    """All `kind='chat'` ledger rows since ``period_start`` (aggregated in Python)."""
-    return await _get("bt_ledger",
-                      {"select": "tg_id,amount", "kind": "eq.chat",
-                       "created_at": f"gte.{period_start}", "limit": "100000"})
+async def chat_counts_since(start_day: str) -> list[dict]:
+    """All `bt_chat_counts` rows on/after ``start_day`` (UTC ISO date), aggregated
+    in Python. Powers the chatters leaderboard, which ranks by the number of
+    messages sent (not points earned)."""
+    return await _get("bt_chat_counts",
+                      {"select": "tg_id,count", "day": f"gte.{start_day}",
+                       "limit": "100000"})
 
 
 async def ledger_since(start: str, exclude_kind: str | None = None) -> list[dict]:
