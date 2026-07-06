@@ -1,15 +1,18 @@
 """Provably-fair seeding helpers (spec §6).
 
-Commit-reveal:
-1. ``bet``     -> server generates ``server_seed``, returns ``server_hash``.
-2. ``settle``  -> outcome derived from the seeded RNG, ``server_seed`` revealed.
-   The client can then verify ``sha256(server_seed) == server_hash``.
+Commit-reveal (Rainbet-style seed-pair reuse — see ``seedpair.py``):
+1. One active pair per user (``server_seed`` + ``client_seed``) is committed via
+   ``server_hash`` and REUSED across bets; each bet advances ``nonce``.
+2. The active ``server_seed`` is revealed only when the pair is ROTATED (not per
+   bet). The client then verifies ``sha256(server_seed) == server_hash`` and can
+   recompute every past bet from ``(server_seed, client_seed, nonce, cursor)``.
 
 RNG derivation:
     h = HMAC_SHA256(server_seed, f"{client_seed}:{nonce}:{cursor}")
     u = sum(h[i] / 256**(i+1) for i in range(4))  in [0, 1)
 
-``cursor`` increments per draw within a round; ``nonce`` per round per user.
+``cursor`` increments per draw within a round; ``nonce`` increments per bet on the
+active pair and resets to 0 on rotation.
 """
 
 import hashlib

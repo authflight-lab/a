@@ -26,8 +26,8 @@ from .auth import require_user
 from .config import settings
 from .db import InsufficientBalance, SupabaseNotConfigured
 from .game import BET_MAX, BET_MIN, GAMES, MULT_CAP, MULTI_STEP, P_MAX, SINGLE_SETTLE
-from .game import dice, flip, highlow, mines, plinko, towers
-from .game.seed import generate_server_seed, rng_float, server_hash
+from .game import dice, flip, highlow, mines, plinko, seedpair, towers
+from .game.seed import rng_float
 
 app = FastAPI(title="Bartender API", version="1.0")
 
@@ -435,6 +435,39 @@ def _initial_state(name: str, np: dict, ss: str, cs: str, nonce: int) -> dict:
     return {}
 
 
+@app.get("/bt/api/game/seeds")
+async def game_seeds(user: dict = Depends(require_user)):
+    """The user's active seed pair (public view). Creates one on first access.
+    NEVER exposes the active server_seed — only its hash and the next hash."""
+    tg_id = user["tg_id"]
+    pair = await db.get_seed_pair(tg_id)
+    if not pair:
+        pair = await db.create_seed_pair(tg_id, seedpair.new_pair())
+    return {"ok": True, **seedpair.public_view(pair)}
+
+
+@app.post("/bt/api/game/seeds/rotate")
+async def game_seeds_rotate(user: dict = Depends(require_user), body: dict | None = Body(default=None)):
+    """Rotate the active pair: reveal the retired server_seed, promote the
+    pre-committed next one, apply an optional new client seed, reset the nonce."""
+    tg_id = user["tg_id"]
+    allowed, retry_after = ratelimit.check(f"game:{tg_id}", limit=60, window_sec=60)
+    if not allowed:
+        return _rl_err(retry_after)
+    # Block rotation mid-round: revealing the active server_seed while a round is
+    # open would let the player derive that round's outcome before it settles.
+    if await db.has_open_round(tg_id):
+        return _err("open_round_exists")
+    body = body or {}
+    new_client_seed = str(body.get("client_seed") or "").strip()
+    pair = await db.get_seed_pair(tg_id)
+    if not pair:
+        pair = await db.create_seed_pair(tg_id, seedpair.new_pair())
+    new_pair, revealed = seedpair.rotate(pair, new_client_seed or None)
+    await db.rotate_seed_pair_row(tg_id, new_pair)
+    return {"ok": True, "server_seed": revealed, **seedpair.public_view(new_pair)}
+
+
 @app.post("/bt/api/game/{name}/bet")
 async def game_bet(name: str, user: dict = Depends(require_user), body: dict | None = Body(default=None)):
     if name not in GAMES:
@@ -449,7 +482,6 @@ async def game_bet(name: str, user: dict = Depends(require_user), body: dict | N
         bet = int(body.get("bet", 0))
     except (TypeError, ValueError):
         return _err("invalid_bet")
-    client_seed = str(body.get("client_seed") or "")
     ok, np = _validate_params(name, body.get("params") or {})
     if not ok:
         return _err("invalid_params")
@@ -466,17 +498,28 @@ async def game_bet(name: str, user: dict = Depends(require_user), body: dict | N
     if await db.get_open_round(tg_id, name):
         return {"ok": False, "error": "open_round_exists"}
 
-    ss = generate_server_seed()
-    sh = server_hash(ss)
-    nonce = await db.next_nonce(tg_id)
-    state = _initial_state(name, np, ss, client_seed, nonce)
+    # Reuse the user's active seed pair (Rainbet-style): the server & client
+    # seeds persist across bets and only the per-pair nonce advances. The active
+    # server_seed is NEVER returned here — only its hash — so a reused seed can't
+    # be predicted; it is revealed solely on rotation (see /bt/api/game/seeds/rotate).
+    pair = await db.get_seed_pair(tg_id)
+    if not pair:
+        pair = await db.create_seed_pair(tg_id, seedpair.new_pair())
+    ss = pair["server_seed"]
+    sh = pair["server_hash"]
+    cs = pair["client_seed"]
+    nonce = int(pair["nonce"])
+    state = _initial_state(name, np, ss, cs, nonce)
 
     try:
         new_balance = await db.apply_ledger(tg_id, -bet, "game_bet", ref=name, meta={"nonce": nonce})
     except InsufficientBalance:
         return {"ok": False, "error": "insufficient_balance"}
 
-    rnd = await db.create_round(tg_id, name, bet, ss, sh, client_seed, nonce, np, state)
+    rnd = await db.create_round(tg_id, name, bet, ss, sh, cs, nonce, np, state)
+    # Advance the per-pair nonce for the next bet, guarded on the value we read
+    # so concurrent bets can't reuse a nonce.
+    await db.bump_nonce(tg_id, nonce)
 
     resp_params = dict(np)
     if name == "highlow":
@@ -522,11 +565,13 @@ async def _finalise(rnd: dict, tg_id: int, multiplier: float, status: str, outco
     else:
         u = await db.get_user(tg_id)
         new_balance = int((u or {}).get("balance", 0))
+    # NB: the active server_seed is intentionally NOT returned here — it stays
+    # secret across the pair's reuse and is revealed only on rotation. Rendering
+    # relies on the outcome fields (e.g. mines includes the full `mines` layout).
     return {
         "outcome": outcome,
         "payout": payout,
         "new_balance": new_balance,
-        "server_seed": rnd["server_seed"],
         "server_hash": rnd["server_hash"],
     }
 
@@ -716,9 +761,9 @@ async def game_cashout(name: str, user: dict = Depends(require_user), body: dict
         if not revealed:
             return _err("must_reveal_first")
         mult = min(mines.multiplier(len(revealed), m), MULT_CAP)
-        # server_seed is revealed to the client on cashout regardless, so the
-        # mine layout is already client-derivable — including it here lets the
-        # UI reveal the full board (no new information is disclosed).
+        # Include the full mine layout so the UI can reveal the board on cashout.
+        # The active server_seed stays secret (revealed only on rotation), so we
+        # disclose the computed layout directly rather than the seed.
         mine_set = sorted(mines.mine_positions(ss, cs, nonce, m))
         outcome = {"revealed": revealed, "mines_count": m, "multiplier": mult, "mines": mine_set}
     elif name == "towers":

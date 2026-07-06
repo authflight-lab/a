@@ -277,14 +277,63 @@ async def create_redemption(tg_id: int, reward_id: str, cost: int) -> dict | Non
 
 
 # ---------------------------------------------------------------------------
-# Game rounds
+# Seed pairs (provably-fair, Rainbet-style reuse; see api/game/seedpair.py)
 # ---------------------------------------------------------------------------
 
-async def next_nonce(tg_id: int) -> int:
-    rows = await _get("bt_game_rounds",
-                      {"tg_id": f"eq.{tg_id}", "select": "nonce", "order": "nonce.desc", "limit": "1"})
-    return (int(rows[0]["nonce"]) + 1) if rows else 0
+async def get_seed_pair(tg_id: int) -> dict | None:
+    rows = await _get("bt_seed_pairs", {"tg_id": f"eq.{tg_id}", "select": "*", "limit": "1"})
+    return rows[0] if rows else None
 
+
+async def create_seed_pair(tg_id: int, pair: dict) -> dict | None:
+    """Insert the active seed pair only if absent — ``ignore-duplicates`` so two
+    concurrent first-bets can't both create one (TOCTOU-safe). Returns the row
+    that ends up stored (the winner's, if we lost the race)."""
+    client = _get_client()
+    row = {"tg_id": tg_id, **pair, "updated_at": _now()}
+    r = await client.post(
+        "/bt_seed_pairs",
+        params={"on_conflict": "tg_id"},
+        json=row,
+        headers={"Prefer": "resolution=ignore-duplicates,return=representation"},
+    )
+    r.raise_for_status()
+    data = r.json() if r.content else None
+    if isinstance(data, list) and data:
+        return data[0]
+    if data:
+        return data
+    # Row already existed (insert ignored) → read the winner back.
+    return await get_seed_pair(tg_id)
+
+
+async def bump_nonce(tg_id: int, expected_nonce: int) -> dict | None:
+    """Advance the per-pair nonce, guarded on the value the bet read, so two
+    concurrent bets can't reuse a nonce."""
+    return await _patch(
+        "bt_seed_pairs",
+        {"tg_id": f"eq.{tg_id}", "nonce": f"eq.{expected_nonce}"},
+        {"nonce": expected_nonce + 1, "updated_at": _now()},
+    )
+
+
+async def rotate_seed_pair_row(tg_id: int, new_pair: dict) -> dict | None:
+    """Persist a rotated pair (the retired server_seed is revealed by the caller)."""
+    return await _patch("bt_seed_pairs", {"tg_id": f"eq.{tg_id}"},
+                        {**new_pair, "updated_at": _now()})
+
+
+async def has_open_round(tg_id: int) -> bool:
+    """True if the user has ANY open round — rotation is blocked while one exists,
+    so revealing the active server seed can't leak an in-progress round's outcome."""
+    rows = await _get("bt_game_rounds",
+                      {"tg_id": f"eq.{tg_id}", "status": "eq.open", "select": "id", "limit": "1"})
+    return bool(rows)
+
+
+# ---------------------------------------------------------------------------
+# Game rounds
+# ---------------------------------------------------------------------------
 
 async def get_open_round(tg_id: int, game: str) -> dict | None:
     rows = await _get("bt_game_rounds",
