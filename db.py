@@ -213,6 +213,24 @@ async def upsert_user(tg_id: int, username: str | None = None,
     return await _upsert("bt_users", row, on_conflict="tg_id")
 
 
+async def mark_registered(tg_id: int, username: str | None = None,
+                          display_name: str | None = None) -> dict | None:
+    """Upsert identity and stamp ``started_at`` the first time the user opens
+    the Mini App. The ``started_at=is.null`` filter makes the PATCH a no-op on
+    repeat calls, so the original registration time is preserved.
+    """
+    row = await upsert_user(tg_id, username, display_name)
+    try:
+        await _patch(
+            "bt_users",
+            {"tg_id": f"eq.{tg_id}", "started_at": "is.null"},
+            {"started_at": _now()},
+        )
+    except Exception:
+        pass  # best-effort; never block /me on the registration stamp
+    return row
+
+
 async def update_user(tg_id: int, patch: dict) -> dict | None:
     patch = {**patch, "updated_at": _now()}
     return await _patch("bt_users", {"tg_id": f"eq.{tg_id}"}, patch)

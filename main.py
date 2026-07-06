@@ -235,9 +235,11 @@ async def me(user: dict = Depends(require_user)):
     allowed, retry_after = ratelimit.check(f"me:{tg_id}", limit=60, window_sec=60)
     if not allowed:
         return _rl_err(retry_after)
-    u = await db.get_user(tg_id)
+    # Opening the Mini App is the definitive "started the app" signal, so stamp
+    # started_at here (once). This also creates the row for a first-time opener.
+    u = await db.mark_registered(tg_id, user.get("username"), user.get("display_name"))
     if u is None:
-        u = await db.upsert_user(tg_id, user.get("username"), user.get("display_name")) or {}
+        u = await db.get_user(tg_id) or {}
     day = _today()
     quest = await db.get_quest(tg_id, day) or {"day": day, "chatted": False, "claimed": False}
     chatted = bool(quest.get("chatted", False))
