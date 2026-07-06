@@ -21,6 +21,7 @@ from typing import Any
 import httpx
 
 from .config import settings
+from . import cache
 
 
 class SupabaseNotConfigured(Exception):
@@ -167,6 +168,7 @@ async def apply_ledger(tg_id: int, amount: int, kind: str, ref: str | None = Non
         if "insufficient_balance" in body:
             raise InsufficientBalance("insufficient_balance")
         raise SupabaseError(f"apply_ledger failed: {r.status_code} {body}")
+    _invalidate_user(tg_id)
     return int(r.json())
 
 
@@ -191,6 +193,7 @@ async def redeem(tg_id: int, reward_id: str, period: str) -> dict:
         if "reward_not_found" in body:
             raise RedeemError("reward_inactive")
         raise SupabaseError(f"redeem failed: {r.status_code} {body}")
+    _invalidate_user(tg_id)
     return r.json()
 
 
@@ -198,9 +201,46 @@ async def redeem(tg_id: int, reward_id: str, period: str) -> dict:
 # Users
 # ---------------------------------------------------------------------------
 
+# In-process cache TTLs. Kept short for the user profile so a cross-process
+# balance change from the bot is never stale for long; the reward catalogue
+# changes rarely so it can live longer.
+_USER_CACHE_TTL = 5.0
+_REWARDS_CACHE_TTL = 60.0
+
+
+def _user_key(tg_id: int) -> str:
+    return f"user:{tg_id}"
+
+
+def _invalidate_user(tg_id: int) -> None:
+    cache.invalidate(_user_key(tg_id))
+
+
 async def get_user(tg_id: int) -> dict | None:
     rows = await _get("bt_users", {"tg_id": f"eq.{tg_id}", "select": "*", "limit": "1"})
     return rows[0] if rows else None
+
+
+async def get_user_cached(tg_id: int) -> dict | None:
+    """Cached read of a user row (short TTL). Use for read-only display paths
+    (``/me``, rich-rank). Balance-authoritative paths (claim, bets) must call
+    :func:`get_user` directly. The cache is dropped on every same-process
+    balance mutation, so a user never sees their own change go stale.
+    """
+    key = _user_key(tg_id)
+    hit = cache.get(key)
+    if hit is not None:
+        return hit
+    row = await get_user(tg_id)
+    if row is not None:
+        cache.put(key, row, _USER_CACHE_TTL)
+    return row
+
+
+def cache_user(tg_id: int, row: dict | None) -> None:
+    """Store a freshly-fetched user row (e.g. after mark_registered in /me)."""
+    if row:
+        cache.put(_user_key(tg_id), row, _USER_CACHE_TTL)
 
 
 async def upsert_user(tg_id: int, username: str | None = None,
@@ -210,7 +250,9 @@ async def upsert_user(tg_id: int, username: str | None = None,
         row["username"] = username
     if display_name is not None:
         row["display_name"] = display_name
-    return await _upsert("bt_users", row, on_conflict="tg_id")
+    result = await _upsert("bt_users", row, on_conflict="tg_id")
+    _invalidate_user(tg_id)
+    return result
 
 
 async def mark_registered(tg_id: int, username: str | None = None,
@@ -233,15 +275,18 @@ async def mark_registered(tg_id: int, username: str | None = None,
 
 async def update_user(tg_id: int, patch: dict) -> dict | None:
     patch = {**patch, "updated_at": _now()}
-    return await _patch("bt_users", {"tg_id": f"eq.{tg_id}"}, patch)
+    result = await _patch("bt_users", {"tg_id": f"eq.{tg_id}"}, patch)
+    _invalidate_user(tg_id)
+    return result
 
 
 async def set_age_ack(tg_id: int) -> None:
-    """Persist ``bt_users.meta.age_ack = true`` (merges into existing meta)."""
-    user = await get_user(tg_id)
-    meta = (user or {}).get("meta") or {}
-    meta["age_ack"] = True
-    await update_user(tg_id, {"meta": meta})
+    """Persist ``bt_users.meta.age_ack = true`` in a single round trip via the
+    ``bt_set_age_ack`` RPC (create-if-absent + jsonb merge)."""
+    client = _get_client()
+    r = await client.post("/rpc/bt_set_age_ack", json={"p_tg_id": tg_id})
+    r.raise_for_status()
+    _invalidate_user(tg_id)
 
 
 # ---------------------------------------------------------------------------
@@ -255,10 +300,10 @@ async def get_quest(tg_id: int, day: str) -> dict | None:
 
 async def set_quest(tg_id: int, day: str, *, chatted: bool | None = None,
                     claimed: bool | None = None) -> dict | None:
+    # merge-duplicates upsert: only the columns we pass are updated on conflict,
+    # so there is no need to read the row first to preserve the other flag. On a
+    # first-of-day insert the omitted flag takes its NOT NULL DEFAULT false.
     row: dict[str, Any] = {"tg_id": tg_id, "day": day}
-    existing = await get_quest(tg_id, day)
-    row["chatted"] = existing.get("chatted", False) if existing else False
-    row["claimed"] = existing.get("claimed", False) if existing else False
     if chatted is not None:
         row["chatted"] = chatted
     if claimed is not None:
@@ -271,10 +316,18 @@ async def set_quest(tg_id: int, day: str, *, chatted: bool | None = None,
 # ---------------------------------------------------------------------------
 
 async def list_rewards(active_only: bool = True) -> list[dict]:
+    # The catalogue changes rarely and /rewards is read-heavy, so cache the rows
+    # (usage/remaining counts are still computed live by the caller).
+    key = f"rewards:{'active' if active_only else 'all'}"
+    hit = cache.get(key)
+    if hit is not None:
+        return hit
     params: dict[str, Any] = {"select": "*", "order": "cost.asc"}
     if active_only:
         params["active"] = "eq.true"
-    return await _get("bt_rewards", params)
+    rows = await _get("bt_rewards", params)
+    cache.put(key, rows, _REWARDS_CACHE_TTL)
+    return rows
 
 
 async def get_reward(reward_id: str) -> dict | None:
@@ -373,6 +426,7 @@ async def open_round(tg_id: int, game: str, bet: int, expected_nonce: int,
         if "insufficient_balance" in body:
             raise InsufficientBalance("insufficient_balance")
         raise SupabaseError(f"open_round failed: {r.status_code} {body}")
+    _invalidate_user(tg_id)
     return r.json()
 
 
@@ -468,12 +522,14 @@ async def claim_daily(tg_id: int, day_start_iso: str, streak: int, now_iso: str)
     Returns the updated row if THIS call won the claim, or ``None`` if another
     concurrent request already claimed today — closing the double-claim race.
     """
-    return await _patch(
+    result = await _patch(
         "bt_users",
         {"tg_id": f"eq.{tg_id}",
          "or": f"(last_claim_at.is.null,last_claim_at.lt.{day_start_iso})"},
         {"streak_days": streak, "last_claim_at": now_iso},
     )
+    _invalidate_user(tg_id)
+    return result
 
 
 # ---------------------------------------------------------------------------

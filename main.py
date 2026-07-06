@@ -236,10 +236,15 @@ async def me(user: dict = Depends(require_user)):
     if not allowed:
         return _rl_err(retry_after)
     # Opening the Mini App is the definitive "started the app" signal, so stamp
-    # started_at here (once). This also creates the row for a first-time opener.
-    u = await db.mark_registered(tg_id, user.get("username"), user.get("display_name"))
-    if u is None:
+    # started_at here (once). Passive chat may have already created the row (with
+    # started_at NULL), so we must still register when it's unstamped — not only
+    # when the row is missing. Once started_at is set, warm-cache opens skip both
+    # writes (the optimization) since re-registering is a no-op.
+    u = await db.get_user_cached(tg_id)
+    if u is None or not u.get("started_at"):
+        await db.mark_registered(tg_id, user.get("username"), user.get("display_name"))
         u = await db.get_user(tg_id) or {}
+        db.cache_user(tg_id, u)
     day = _today()
     quest = await db.get_quest(tg_id, day) or {"day": day, "chatted": False, "claimed": False}
     chatted = bool(quest.get("chatted", False))
@@ -317,8 +322,7 @@ async def age_ack(user: dict = Depends(require_user)):
     allowed, retry_after = ratelimit.check(f"age_ack:{tg_id}", limit=5, window_sec=60)
     if not allowed:
         return _rl_err(retry_after)
-    if await db.get_user(tg_id) is None:
-        await db.upsert_user(tg_id, user.get("username"), user.get("display_name"))
+    # bt_set_age_ack create-if-absents the row, so no existence check is needed.
     await db.set_age_ack(tg_id)
     return {"ok": True}
 
@@ -475,7 +479,7 @@ async def leaderboard(
                  "value": int(r.get("balance", 0))}
                 for i, r in enumerate(top)
             ]
-            u = await db.get_user(tg_id)
+            u = await db.get_user_cached(tg_id)
             you = None
             if u is not None:
                 bal = int(u.get("balance", 0))
