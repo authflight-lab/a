@@ -440,6 +440,11 @@ async def game_seeds(user: dict = Depends(require_user)):
     """The user's active seed pair (public view). Creates one on first access.
     NEVER exposes the active server_seed — only its hash and the next hash."""
     tg_id = user["tg_id"]
+    # Bootstrap the user row first: bt_seed_pairs.tg_id has an FK to bt_users, so
+    # a brand-new user hitting this endpoint before /me or a bet would otherwise
+    # fail on the seed-pair insert.
+    if await db.get_user(tg_id) is None:
+        await db.upsert_user(tg_id, user.get("username"), user.get("display_name"))
     pair = await db.get_seed_pair(tg_id)
     if not pair:
         pair = await db.create_seed_pair(tg_id, seedpair.new_pair())
@@ -459,6 +464,9 @@ async def game_seeds_rotate(user: dict = Depends(require_user), body: dict | Non
     # Ensure a pair exists, then rotate it atomically. The RPC locks the seed-pair
     # row and refuses if ANY round is open (checked under that lock), so revealing
     # the active server_seed can never race a concurrent bet that would still use it.
+    # Bootstrap the user row first (bt_seed_pairs.tg_id FK -> bt_users).
+    if await db.get_user(tg_id) is None:
+        await db.upsert_user(tg_id, user.get("username"), user.get("display_name"))
     if not await db.get_seed_pair(tg_id):
         await db.create_seed_pair(tg_id, seedpair.new_pair())
     next_seed, next_hash = seedpair.fresh_next()

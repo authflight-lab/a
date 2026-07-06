@@ -55,6 +55,11 @@ class FakeDB:
         return self.pairs.get(tg_id)
 
     async def create_seed_pair(self, tg_id, pair):
+        # Mirror the real FK: bt_seed_pairs.tg_id references bt_users(tg_id), so a
+        # seed pair cannot be created before the user row exists.
+        if tg_id not in self.users:
+            raise db.SupabaseError("insert or update on table \"bt_seed_pairs\" "
+                                   "violates foreign key constraint")
         return self.pairs.setdefault(tg_id, {"tg_id": tg_id, **pair})
 
     async def open_round(self, tg_id, game, bet, expected_nonce, params, outcome):
@@ -148,6 +153,25 @@ def test_seeds_endpoint_never_returns_active_server_seed(client):
     assert body["client_seed"]
     # The hash shown must be the commitment to the (hidden) active server seed.
     assert body["server_hash"] == _sha(client.fake.pairs[1]["server_seed"])
+
+
+def test_seeds_endpoint_bootstraps_a_brand_new_user(client):
+    # Fresh user: no prior /me or bet, so no bt_users row yet. The seeds endpoint
+    # must bootstrap the user before creating the FK-bound seed pair.
+    assert client.fake.users == {}
+    r = client.get("/bt/api/game/seeds")
+    assert r.status_code == 200
+    assert 1 in client.fake.users  # user row was created
+    assert 1 in client.fake.pairs
+    assert "server_seed" not in r.json()
+
+
+def test_rotate_endpoint_bootstraps_a_brand_new_user(client):
+    assert client.fake.users == {}
+    r = client.post("/bt/api/game/seeds/rotate", json={})
+    assert r.status_code == 200
+    assert 1 in client.fake.users
+    assert "server_seed" in r.json()  # rotate reveals the retired seed
 
 
 def test_bet_and_settle_never_leak_active_server_seed(client):
