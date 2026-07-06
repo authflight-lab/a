@@ -251,11 +251,32 @@ async def me(user: dict = Depends(require_user)):
     claimed = bool(quest.get("claimed", False))
     meta = u.get("meta") or {}
     raw_backlog = int(u.get("backlog_pts", 0))
+    bal = int(u.get("balance", 0))
+
+    # Stats card: only computed when backlog is cleared (registered & claimed).
+    activity: dict | None = None
+    if raw_backlog == 0:
+        try:
+            us, rr = await asyncio.gather(
+                db.user_stats(tg_id),
+                db.rich_rank(tg_id, bal),
+                return_exceptions=True,
+            )
+            if isinstance(us, dict) and not isinstance(rr, Exception):
+                activity = {
+                    "messages_sent": int(us.get("messages_sent", 0)),
+                    "amount_wagered": int(us.get("amount_wagered", 0)),
+                    "messages_rank": int(us.get("messages_rank", 1)),
+                    "rich_rank": int(rr),
+                }
+        except Exception:
+            pass
+
     return {
         "tg_id": tg_id,
         "username": u.get("username"),
         "display_name": u.get("display_name"),
-        "balance": int(u.get("balance", 0)),
+        "balance": bal,
         "streak_days": int(u.get("streak_days", 0)),
         "last_claim_at": u.get("last_claim_at"),
         "quest": {"day": day, "chatted": chatted, "claimed": claimed},
@@ -266,6 +287,8 @@ async def me(user: dict = Depends(require_user)):
         "multiplier_active": bool(u.get("name_multiplier", False)),
         # Backlog from pre-registration chat activity, shown at 75% of raw value.
         "backlog_pts": int(raw_backlog * 0.75) if raw_backlog > 0 else 0,
+        # Activity stats — null while backlog is unclaimed (hides the card).
+        "stats": activity,
     }
 
 

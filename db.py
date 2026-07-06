@@ -562,6 +562,20 @@ async def rich_rank(tg_id: int, balance: int) -> int:
     return (int(total) + 1) if total.isdigit() else 1
 
 
+async def user_stats(tg_id: int) -> dict:
+    """Call ``bt_user_stats`` — single-round-trip home-card stats.
+
+    Returns ``{messages_sent, amount_wagered, messages_rank}``.
+    Raises ``SupabaseError`` on failure.
+    """
+    client = _get_client()
+    r = await client.post("/rpc/bt_user_stats", json={"p_tg_id": tg_id})
+    if r.status_code >= 400:
+        raise SupabaseError(f"bt_user_stats failed: {r.status_code} {r.text[:200]}")
+    data = r.json()
+    return data if isinstance(data, dict) else {}
+
+
 async def claim_backlog(tg_id: int) -> dict:
     """Atomically credit 75% of the user's backlog and clear it.
 
