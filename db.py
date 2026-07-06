@@ -544,19 +544,42 @@ async def ledger_history(tg_id: int, limit: int = 50) -> list[dict]:
 
 async def leaderboard_rich(limit: int = 20) -> list[dict]:
     return await _get("bt_users",
-                      {"select": "tg_id,display_name,balance", "order": "balance.desc", "limit": str(limit)})
+                      {"select": "tg_id,display_name,balance",
+                       "order": "balance.desc", "limit": str(limit),
+                       "started_at": "not.is.null"})
 
 
 async def rich_rank(tg_id: int, balance: int) -> int:
-    """1-based rank on the rich list = count(users with balance > mine) + 1."""
+    """1-based rank on the rich list = count(registered users with balance > mine) + 1."""
     client = _get_client()
     r = await client.get("/bt_users",
-                         params={"select": "tg_id", "balance": f"gt.{balance}"},
+                         params={"select": "tg_id", "balance": f"gt.{balance}",
+                                 "started_at": "not.is.null"},
                          headers={"Prefer": "count=exact", "Range-Unit": "items", "Range": "0-0"})
     r.raise_for_status()
     cr = r.headers.get("content-range", "*/0")
     total = cr.split("/")[-1]
     return (int(total) + 1) if total.isdigit() else 1
+
+
+async def claim_backlog(tg_id: int) -> dict:
+    """Atomically credit 75% of the user's backlog and clear it.
+
+    Calls ``bt_claim_backlog`` which writes a ``backlog_claim`` ledger row and
+    returns ``{awarded, new_balance}``. Invalidates the user cache.
+    """
+    client = _get_client()
+    r = await client.post("/rpc/bt_claim_backlog", json={"p_tg_id": tg_id})
+    body = ""
+    try:
+        body = r.text
+    except Exception:
+        pass
+    if r.status_code >= 400:
+        raise SupabaseError(f"bt_claim_backlog failed: {r.status_code} {body}")
+    _invalidate_user(tg_id)
+    data = r.json()
+    return data if isinstance(data, dict) else {"awarded": 0, "new_balance": 0}
 
 
 async def chat_counts_since(start_day: str) -> list[dict]:

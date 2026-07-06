@@ -250,6 +250,7 @@ async def me(user: dict = Depends(require_user)):
     chatted = bool(quest.get("chatted", False))
     claimed = bool(quest.get("claimed", False))
     meta = u.get("meta") or {}
+    raw_backlog = int(u.get("backlog_pts", 0))
     return {
         "tg_id": tg_id,
         "username": u.get("username"),
@@ -263,6 +264,28 @@ async def me(user: dict = Depends(require_user)):
         # @partygc name-tag perk (drives the gold home-screen badge). The bot
         # owns activation/verification; the app just reflects the stored flag.
         "multiplier_active": bool(u.get("name_multiplier", False)),
+        # Backlog from pre-registration chat activity, shown at 75% of raw value.
+        "backlog_pts": int(raw_backlog * 0.75) if raw_backlog > 0 else 0,
+    }
+
+
+@app.post("/bt/api/backlog/claim")
+async def backlog_claim(user: dict = Depends(require_user)):
+    tg_id = user["tg_id"]
+    allowed, retry_after = ratelimit.check(f"backlog:{tg_id}", limit=3, window_sec=60)
+    if not allowed:
+        return _rl_err(retry_after)
+    try:
+        result = await db.claim_backlog(tg_id)
+    except db.SupabaseNotConfigured:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "not_configured"})
+    except Exception as e:
+        logging.getLogger(__name__).warning("bt_backlog_claim_error", extra={"error": str(e)})
+        return {"ok": False, "error": "server_error"}
+    return {
+        "ok": True,
+        "awarded": int(result.get("awarded", 0)),
+        "new_balance": int(result.get("new_balance", 0)),
     }
 
 
