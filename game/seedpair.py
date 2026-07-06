@@ -23,6 +23,14 @@ def random_client_seed() -> str:
     return os.urandom(16).hex()
 
 
+def fresh_next() -> tuple[str, str]:
+    """Generate a fresh pre-commit ``(next_server_seed, next_server_hash)`` — used
+    on rotation to commit the seed that replaces the just-promoted one. Kept in
+    Python (not SQL) so all server-seed generation lives in one place."""
+    nx = generate_server_seed()
+    return nx, server_hash(nx)
+
+
 def new_pair(client_seed: str | None = None) -> dict:
     """A fresh active pair: random server seed + a pre-committed next server seed."""
     cs = (client_seed or "").strip() or random_client_seed()

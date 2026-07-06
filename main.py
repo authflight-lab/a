@@ -454,18 +454,21 @@ async def game_seeds_rotate(user: dict = Depends(require_user), body: dict | Non
     allowed, retry_after = ratelimit.check(f"game:{tg_id}", limit=60, window_sec=60)
     if not allowed:
         return _rl_err(retry_after)
-    # Block rotation mid-round: revealing the active server_seed while a round is
-    # open would let the player derive that round's outcome before it settles.
-    if await db.has_open_round(tg_id):
-        return _err("open_round_exists")
     body = body or {}
     new_client_seed = str(body.get("client_seed") or "").strip()
-    pair = await db.get_seed_pair(tg_id)
-    if not pair:
-        pair = await db.create_seed_pair(tg_id, seedpair.new_pair())
-    new_pair, revealed = seedpair.rotate(pair, new_client_seed or None)
-    await db.rotate_seed_pair_row(tg_id, new_pair)
-    return {"ok": True, "server_seed": revealed, **seedpair.public_view(new_pair)}
+    # Ensure a pair exists, then rotate it atomically. The RPC locks the seed-pair
+    # row and refuses if ANY round is open (checked under that lock), so revealing
+    # the active server_seed can never race a concurrent bet that would still use it.
+    if not await db.get_seed_pair(tg_id):
+        await db.create_seed_pair(tg_id, seedpair.new_pair())
+    next_seed, next_hash = seedpair.fresh_next()
+    try:
+        rotated = await db.rotate_seed_pair(tg_id, new_client_seed, next_seed, next_hash)
+    except db.OpenRoundExists:
+        # Block rotation mid-round: revealing the active server_seed while a round
+        # is open would let the player derive that round's outcome before it settles.
+        return _err("open_round_exists")
+    return {"ok": True, **rotated}
 
 
 @app.post("/bt/api/game/{name}/bet")
@@ -505,30 +508,42 @@ async def game_bet(name: str, user: dict = Depends(require_user), body: dict | N
     pair = await db.get_seed_pair(tg_id)
     if not pair:
         pair = await db.create_seed_pair(tg_id, seedpair.new_pair())
-    ss = pair["server_seed"]
-    sh = pair["server_hash"]
-    cs = pair["client_seed"]
-    nonce = int(pair["nonce"])
-    state = _initial_state(name, np, ss, cs, nonce)
 
-    try:
-        new_balance = await db.apply_ledger(tg_id, -bet, "game_bet", ref=name, meta={"nonce": nonce})
-    except InsufficientBalance:
-        return {"ok": False, "error": "insufficient_balance"}
-
-    rnd = await db.create_round(tg_id, name, bet, ss, sh, cs, nonce, np, state)
-    # Advance the per-pair nonce for the next bet, guarded on the value we read
-    # so concurrent bets can't reuse a nonce.
-    await db.bump_nonce(tg_id, nonce)
+    # Reserve the nonce and open the round atomically (single locked RPC), so two
+    # concurrent bets can't share a nonce and a rotation can't reveal the seed a
+    # bet is using. We compute the per-game state with the nonce we read; if a
+    # concurrent bet advanced it first, the RPC rejects (nonce_conflict) and we
+    # retry with the fresh nonce.
+    state: dict = {}
+    result: dict | None = None
+    for _ in range(4):
+        ss = pair["server_seed"]
+        cs = pair["client_seed"]
+        nonce = int(pair["nonce"])
+        state = _initial_state(name, np, ss, cs, nonce)
+        try:
+            result = await db.open_round(tg_id, name, bet, nonce, np, state)
+            break
+        except InsufficientBalance:
+            return {"ok": False, "error": "insufficient_balance"}
+        except db.OpenRoundExists:
+            return {"ok": False, "error": "open_round_exists"}
+        except db.NonceConflict:
+            refreshed = await db.get_seed_pair(tg_id)
+            if not refreshed:
+                break
+            pair = refreshed
+    if result is None:
+        return _err("try_again", 409)
 
     resp_params = dict(np)
     if name == "highlow":
         resp_params["start_card"] = state["start_card"]
     return {
-        "round_id": (rnd or {}).get("id"),
-        "server_hash": sh,
-        "nonce": nonce,
-        "balance": new_balance,
+        "round_id": result.get("round_id"),
+        "server_hash": result.get("server_hash"),
+        "nonce": result.get("nonce"),
+        "balance": result.get("balance"),
         "params": resp_params,
     }
 

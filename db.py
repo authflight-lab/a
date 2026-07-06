@@ -44,6 +44,19 @@ class RedeemError(Exception):
         super().__init__(code)
 
 
+class OpenRoundExists(Exception):
+    """Raised by ``bt_open_round``/``bt_rotate_seed_pair`` when an open round
+    blocks the operation (one open round per (user, game); rotation forbidden
+    while any round is open)."""
+
+
+class NonceConflict(Exception):
+    """Raised by ``bt_open_round`` when the seed pair's nonce advanced (a
+    concurrent bet) between the caller reading it and the guarded reservation —
+    the caller must re-read the pair and retry so the stored round's RNG inputs
+    match its nonce."""
+
+
 _client: httpx.AsyncClient | None = None
 
 
@@ -307,28 +320,73 @@ async def create_seed_pair(tg_id: int, pair: dict) -> dict | None:
     return await get_seed_pair(tg_id)
 
 
-async def bump_nonce(tg_id: int, expected_nonce: int) -> dict | None:
-    """Advance the per-pair nonce, guarded on the value the bet read, so two
-    concurrent bets can't reuse a nonce."""
-    return await _patch(
-        "bt_seed_pairs",
-        {"tg_id": f"eq.{tg_id}", "nonce": f"eq.{expected_nonce}"},
-        {"nonce": expected_nonce + 1, "updated_at": _now()},
-    )
+async def open_round(tg_id: int, game: str, bet: int, expected_nonce: int,
+                     params: dict, outcome: dict | None) -> dict:
+    """Atomically reserve the pair's next nonce and open a round via the
+    ``bt_open_round`` RPC (locks the seed-pair row for the whole transaction, so
+    it serialises against rotation). The caller computes ``outcome`` using
+    ``expected_nonce``; the RPC verifies the locked nonce still matches.
+
+    Returns ``{round_id, server_hash, nonce, balance}``.
+
+    Raises ``NonceConflict`` (retry with a fresh nonce), ``OpenRoundExists``
+    (a round for this game is already open), or ``InsufficientBalance``.
+    """
+    client = _get_client()
+    payload = {
+        "p_tg_id": tg_id,
+        "p_game": game,
+        "p_bet": bet,
+        "p_expected_nonce": expected_nonce,
+        "p_params": params,
+        "p_outcome": outcome or {},
+    }
+    r = await client.post("/rpc/bt_open_round", json=payload)
+    if r.status_code >= 400:
+        body = ""
+        try:
+            body = r.text
+        except Exception:
+            pass
+        if "nonce_conflict" in body:
+            raise NonceConflict()
+        if "open_round_exists" in body:
+            raise OpenRoundExists()
+        if "insufficient_balance" in body:
+            raise InsufficientBalance("insufficient_balance")
+        raise SupabaseError(f"open_round failed: {r.status_code} {body}")
+    return r.json()
 
 
-async def rotate_seed_pair_row(tg_id: int, new_pair: dict) -> dict | None:
-    """Persist a rotated pair (the retired server_seed is revealed by the caller)."""
-    return await _patch("bt_seed_pairs", {"tg_id": f"eq.{tg_id}"},
-                        {**new_pair, "updated_at": _now()})
+async def rotate_seed_pair(tg_id: int, client_seed: str,
+                           next_server_seed: str, next_server_hash: str) -> dict:
+    """Atomically rotate the pair via the ``bt_rotate_seed_pair`` RPC: reveal the
+    retired server seed, promote the pre-committed next one, commit the caller's
+    freshly-generated next seed, apply an optional new client seed, reset nonce.
 
+    Returns ``{server_seed, client_seed, nonce, server_hash, next_server_hash}``.
 
-async def has_open_round(tg_id: int) -> bool:
-    """True if the user has ANY open round — rotation is blocked while one exists,
-    so revealing the active server seed can't leak an in-progress round's outcome."""
-    rows = await _get("bt_game_rounds",
-                      {"tg_id": f"eq.{tg_id}", "status": "eq.open", "select": "id", "limit": "1"})
-    return bool(rows)
+    Raises ``OpenRoundExists`` if any round is open (rotation would otherwise
+    leak an in-progress round's server seed).
+    """
+    client = _get_client()
+    payload = {
+        "p_tg_id": tg_id,
+        "p_client_seed": client_seed or "",
+        "p_next_server_seed": next_server_seed,
+        "p_next_server_hash": next_server_hash,
+    }
+    r = await client.post("/rpc/bt_rotate_seed_pair", json=payload)
+    if r.status_code >= 400:
+        body = ""
+        try:
+            body = r.text
+        except Exception:
+            pass
+        if "open_round_exists" in body:
+            raise OpenRoundExists()
+        raise SupabaseError(f"rotate_seed_pair failed: {r.status_code} {body}")
+    return r.json()
 
 
 # ---------------------------------------------------------------------------
