@@ -835,10 +835,13 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
     if name == "mines":
         m = int(params["mines"])
         revealed = list(state.get("revealed", []))
-        if not isinstance(move, (int, str)):
+        # The client sends the move as {"cell": <idx>} (matching the other games'
+        # dict-shaped moves); accept a bare int/str too for robustness.
+        raw_cell = move.get("cell") if isinstance(move, dict) else move
+        if not isinstance(raw_cell, (int, str)):
             return _err("invalid_move")
         try:
-            cell = int(move)
+            cell = int(raw_cell)
         except (TypeError, ValueError):
             return _err("invalid_move")
         if cell < 0 or cell >= mines.TOTAL or cell in revealed:
@@ -870,10 +873,14 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
     if name == "towers":
         difficulty = str(params["difficulty"])
         floor = int(state.get("floor", 0))
-        if not isinstance(move, (int, str)):
+        # The client sends {"floor": <f>, "choice": <col>}; the authoritative floor
+        # is tracked server-side, so only the chosen column is used. Accept a bare
+        # int/str too for robustness.
+        raw_col = move.get("choice") if isinstance(move, dict) else move
+        if not isinstance(raw_col, (int, str)):
             return _err("invalid_move")
         try:
-            col = int(move)
+            col = int(raw_col)
         except (TypeError, ValueError):
             return _err("invalid_move")
         if col < 0 or col >= towers.columns(difficulty):
