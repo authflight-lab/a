@@ -378,6 +378,21 @@ async def chatters_ledger(period_start: str) -> list[dict]:
                        "created_at": f"gte.{period_start}", "limit": "100000"})
 
 
+async def ledger_since(start: str, exclude_kind: str | None = None) -> list[dict]:
+    """All ledger rows (any kind) since ``start`` — used for the weekly rich
+    leaderboard's net-points-gained calculation (aggregated in Python).
+
+    ``exclude_kind`` drops one kind (e.g. 'weekly_bonus') so a prior week's
+    prize, credited at the Monday boundary, doesn't give past winners a head
+    start in the new week's rich race."""
+    params: dict[str, Any] = {
+        "select": "tg_id,amount", "created_at": f"gte.{start}", "limit": "100000",
+    }
+    if exclude_kind:
+        params["kind"] = f"neq.{exclude_kind}"
+    return await _get("bt_ledger", params)
+
+
 async def display_names(tg_ids: list[int]) -> dict[int, str]:
     if not tg_ids:
         return {}

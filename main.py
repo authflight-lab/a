@@ -12,6 +12,7 @@ Importing this module performs NO network I/O; Supabase is contacted lazily and,
 when unconfigured, endpoints return 503.
 """
 
+import logging
 import math
 import time
 from collections import defaultdict
@@ -21,7 +22,7 @@ from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from . import db
+from . import db, notify
 from .auth import require_user
 from .config import settings
 from .db import InsufficientBalance, SupabaseNotConfigured
@@ -30,6 +31,8 @@ from .game import dice, flip, highlow, mines, plinko, towers
 from .game.seed import generate_server_seed, rng_float, server_hash
 
 app = FastAPI(title="Bartender API", version="1.0")
+
+logger = logging.getLogger("bt.api")
 
 # CORS: explicit allowlist = BT_APP_ORIGIN only. Never a wildcard (spec §8).
 _origins = [settings.bt_app_origin] if settings.bt_app_origin else []
@@ -73,6 +76,17 @@ def _period() -> str:
 def _period_start() -> str:
     now = datetime.now(timezone.utc)
     return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+
+# Beginning of time — used as an "all-time" lower bound for ledger scans.
+_EPOCH = "1970-01-01T00:00:00+00:00"
+
+
+def _week_start() -> str:
+    """Start of the current UTC week (Monday 00:00:00 UTC), ISO-formatted."""
+    now = datetime.now(timezone.utc)
+    monday = now - timedelta(days=now.weekday())
+    return monday.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
 
 
 def _daily_claim(streak: int) -> int:
@@ -253,6 +267,21 @@ async def redeem(user: dict = Depends(require_user), body: dict | None = Body(de
     except db.RedeemError as e:
         return {"ok": False, "error": e.code}
 
+    # Notify the user via Telegram DM that their redemption is pending. Best
+    # effort — a failed DM must never break the (already-committed) redemption.
+    try:
+        reward = await db.get_reward(reward_id)
+        title = (reward or {}).get("title") or "your reward"
+        cost = int((reward or {}).get("cost", 0))
+        await notify.send_dm(
+            tg_id,
+            f"🍸 <b>Redemption received</b>\n\n"
+            f"You redeemed <b>{notify.esc(title)}</b> for {cost} pts.\n"
+            f"Status: <b>pending</b> — we'll message you when it's processed.",
+        )
+    except Exception as e:
+        logger.warning("bt_redeem_dm_error", error=str(e))
+
     return {
         "ok": True,
         "redemption_id": result.get("redemption_id"),
@@ -264,44 +293,68 @@ async def redeem(user: dict = Depends(require_user), body: dict | None = Body(de
 # Leaderboard / history
 # ---------------------------------------------------------------------------
 
-@app.get("/bt/api/leaderboard")
-async def leaderboard(tab: str = "rich", user: dict = Depends(require_user)):
-    tg_id = user["tg_id"]
-    if tab not in ("rich", "chatters"):
-        return _err("invalid_tab")
-
-    if tab == "rich":
-        top = await db.leaderboard_rich(limit=20)
-        rows = [
-            {"rank": i + 1, "tg_id": int(r["tg_id"]),
-             "display_name": r.get("display_name") or str(r["tg_id"]),
-             "value": int(r.get("balance", 0))}
-            for i, r in enumerate(top)
-        ]
-        u = await db.get_user(tg_id)
-        you = None
-        if u is not None:
-            bal = int(u.get("balance", 0))
-            you = {"rank": await db.rich_rank(tg_id, bal), "value": bal}
-        return {"tab": tab, "rows": rows, "you": you}
-
-    # chatters: points earned with kind='chat' this period.
-    ledger = await db.chatters_ledger(_period_start())
-    totals: dict[int, int] = defaultdict(int)
-    for row in ledger:
-        totals[int(row["tg_id"])] += int(row["amount"])
+async def _rows_from_totals(
+    totals: dict[int, int], tg_id: int, limit: int = 20
+) -> tuple[list[dict], dict | None]:
+    """Build ranked rows + the caller's own position from a {tg_id: value} map."""
     ordered = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
-    top_ids = [uid for uid, _ in ordered[:20]]
+    top_ids = [uid for uid, _ in ordered[:limit]]
     names = await db.display_names(top_ids)
     rows = [
         {"rank": i + 1, "tg_id": uid, "display_name": names.get(uid, str(uid)), "value": val}
-        for i, (uid, val) in enumerate(ordered[:20])
+        for i, (uid, val) in enumerate(ordered[:limit])
     ]
     you = None
     if tg_id in totals:
         rank = 1 + sum(1 for _, v in ordered if v > totals[tg_id])
         you = {"rank": rank, "value": totals[tg_id]}
-    return {"tab": tab, "rows": rows, "you": you}
+    return rows, you
+
+
+@app.get("/bt/api/leaderboard")
+async def leaderboard(
+    tab: str = "rich", period: str = "weekly", user: dict = Depends(require_user)
+):
+    tg_id = user["tg_id"]
+    if tab not in ("rich", "chatters"):
+        return _err("invalid_tab")
+    if period not in ("weekly", "alltime"):
+        period = "weekly"
+
+    if tab == "rich":
+        if period == "alltime":
+            # All-time rich list = current balances.
+            top = await db.leaderboard_rich(limit=20)
+            rows = [
+                {"rank": i + 1, "tg_id": int(r["tg_id"]),
+                 "display_name": r.get("display_name") or str(r["tg_id"]),
+                 "value": int(r.get("balance", 0))}
+                for i, r in enumerate(top)
+            ]
+            u = await db.get_user(tg_id)
+            you = None
+            if u is not None:
+                bal = int(u.get("balance", 0))
+                you = {"rank": await db.rich_rank(tg_id, bal), "value": bal}
+            return {"tab": tab, "period": period, "rows": rows, "you": you}
+
+        # Weekly rich = net points gained this week (sum of all ledger amounts),
+        # excluding the weekly bonus itself so past winners don't get a head start.
+        ledger = await db.ledger_since(_week_start(), exclude_kind="weekly_bonus")
+        totals: dict[int, int] = defaultdict(int)
+        for row in ledger:
+            totals[int(row["tg_id"])] += int(row["amount"])
+        rows, you = await _rows_from_totals(totals, tg_id)
+        return {"tab": tab, "period": period, "rows": rows, "you": you}
+
+    # chatters: points earned with kind='chat'.
+    start = _week_start() if period == "weekly" else _EPOCH
+    ledger = await db.chatters_ledger(start)
+    totals = defaultdict(int)
+    for row in ledger:
+        totals[int(row["tg_id"])] += int(row["amount"])
+    rows, you = await _rows_from_totals(totals, tg_id)
+    return {"tab": tab, "period": period, "rows": rows, "you": you}
 
 
 @app.get("/bt/api/history")

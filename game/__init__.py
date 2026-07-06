@@ -14,7 +14,7 @@ Global constants (spec §6):
 EPS = 0.01
 P_MAX = 5000
 BET_MIN = 1
-BET_MAX = 500
+BET_MAX = 350
 
 SINGLE_SETTLE = ("dice", "plinko")
 MULTI_STEP = ("flip", "mines", "towers", "highlow")
