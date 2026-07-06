@@ -675,6 +675,10 @@ async def game_cashout(name: str, user: dict = Depends(require_user), body: dict
     elif name == "mines":
         m = int(params["mines"])
         revealed = list(state.get("revealed", []))
+        # Must reveal at least one safe tile before cashing out — no bet-then-
+        # immediate-cashout (which would otherwise pay the 1.0x baseline back).
+        if not revealed:
+            return _err("must_reveal_first")
         mult = min(mines.multiplier(len(revealed), m), MULT_CAP)
         # server_seed is revealed to the client on cashout regardless, so the
         # mine layout is already client-derivable — including it here lets the
@@ -684,6 +688,9 @@ async def game_cashout(name: str, user: dict = Depends(require_user), body: dict
     elif name == "towers":
         difficulty = str(params["difficulty"])
         floor = int(state.get("floor", 0))
+        # Must climb at least one floor before cashing out (no bet-then-cashout).
+        if floor <= 0:
+            return _err("must_climb_first")
         mult = min(towers.multiplier(floor, difficulty), MULT_CAP)
         outcome = {"floor": floor, "difficulty": difficulty, "multiplier": mult}
     else:  # highlow

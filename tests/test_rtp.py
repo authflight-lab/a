@@ -30,9 +30,13 @@ def test_flip_rtp():
 
 
 def test_mines_rtp():
+    # Mines front-loads its house edge (edge decays from a heavier first-reveal
+    # edge back to the base EPS), so the per-reveal RTP is 1 - edge(k) — the same
+    # for every mine count m at a given reveal depth k, but no longer a flat
+    # TARGET across depths.
     for m in range(1, mines.TOTAL):  # 1..24 mines
         for k in range(0, mines.TOTAL - m + 1):  # 0..(safe cells) reveals
-            assert abs(_rtp(mines.rtp_distribution(k, m)) - TARGET) < TOL
+            assert abs(_rtp(mines.rtp_distribution(k, m)) - mines.MULT_SCALE * (1 - mines.edge(k))) < TOL
 
 
 def test_towers_rtp():
