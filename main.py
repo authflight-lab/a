@@ -734,11 +734,22 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
     r = int(state.get("rank", 0))
     step_n = int(state.get("step", 0))
     cur_mult = float(state.get("multiplier", 1.0))
+    draw = lambda i: rng_float(ss, cs, nonce, i)
+    slot = step_n + 1
+    # Skip: swap the current decision card for a fresh one without wagering. The
+    # chain multiplier is unchanged and a new slot is consumed so the draw stays
+    # provably deterministic. This is EV-neutral — every guess pays EV = 1 - HL_EPS
+    # regardless of the card — so unlimited skips can't be exploited.
+    if guess == "skip" or (isinstance(move, dict) and move.get("skip")):
+        new_rank = highlow.current_card(draw, slot)
+        new_state = {"rank": new_rank, "step": step_n + 1, "multiplier": cur_mult}
+        await db.update_round(rnd["id"], {"outcome": new_state})
+        return {"outcome_step": {"current": new_rank, "prev": r, "guess": "skip",
+                                 "skipped": True, "win": True},
+                "multiplier": cur_mult, "can_cashout": True, "busted": False, "done": False}
     if (guess not in ("higher", "lower") or not highlow.can_pick(guess, r)
             or not highlow.within_cap(cur_mult, guess, r)):
         return _err("invalid_move")
-    draw = lambda i: rng_float(ss, cs, nonce, i)
-    slot = step_n + 1
     drawn = highlow.reveal_card(draw, slot)  # revealed card (full 1..13 deck)
     win = highlow.resolve(guess, r, drawn)
     if not win:

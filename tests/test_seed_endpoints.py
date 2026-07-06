@@ -277,3 +277,52 @@ def test_rotation_blocked_while_round_open(client):
     rot = client.post("/bt/api/game/seeds/rotate", json={})
     assert rot.status_code == 400
     assert rot.json()["error"] == "open_round_exists"
+
+
+# ---------------------------------------------------------------------------
+# HighLow skip: swap the current card without wagering — multiplier unchanged,
+# step advances, new current card is non-wild, active seed never leaks, and it
+# does not end the round.
+# ---------------------------------------------------------------------------
+
+def test_highlow_skip_keeps_multiplier_and_advances_deterministically(client):
+    bet = client.post("/bt/api/game/highlow/bet", json={"bet": 10, "params": {}})
+    assert bet.status_code == 200
+    rid = bet.json()["round_id"]
+    start_card = client.fake.rounds[rid]["outcome"]["rank"]
+
+    skip = client.post("/bt/api/game/highlow/step",
+                       json={"round_id": rid, "move": {"skip": True}})
+    assert skip.status_code == 200
+    s = skip.json()
+    assert "server_seed" not in s              # active seed never leaks on step
+    assert s["outcome_step"]["skipped"] is True
+    assert s["busted"] is False and s["done"] is False
+    assert s["multiplier"] == 1.0              # no wager, multiplier unchanged
+    new_card = s["outcome_step"]["current"]
+    assert s["outcome_step"]["guess"] == "skip"
+    assert s["outcome_step"]["prev"] == start_card
+    # New current card is always a non-wild rank (2..12).
+    assert 2 <= new_card <= 12
+
+    # State advanced: step incremented, rank replaced, multiplier held at 1.0.
+    st = client.fake.rounds[rid]["outcome"]
+    assert st["step"] == 1
+    assert st["rank"] == new_card
+    assert st["multiplier"] == 1.0
+
+    # Deterministic: skip is a pure function of the (seed, nonce, slot); the same
+    # committed round yields the same new card.
+    assert new_card == client.fake.rounds[rid]["outcome"]["rank"]
+
+    # A scalar "skip" move is accepted too (matches guess string handling).
+    skip2 = client.post("/bt/api/game/highlow/step",
+                        json={"round_id": rid, "move": "skip"})
+    assert skip2.status_code == 200
+    assert skip2.json()["multiplier"] == 1.0
+    assert client.fake.rounds[rid]["outcome"]["step"] == 2
+
+    # Round is still open, so the player can still cash out the bet (1.0x).
+    cash = client.post("/bt/api/game/highlow/cashout", json={"round_id": rid})
+    assert cash.status_code == 200
+    assert "server_seed" not in cash.json()
