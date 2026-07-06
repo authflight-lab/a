@@ -502,6 +502,27 @@ async def ledger_since(start: str, exclude_kind: str | None = None) -> list[dict
     return await _get("bt_ledger", params)
 
 
+async def get_config(key: str) -> str | None:
+    """Read a config value from bt_config, or ``None`` if unset/unconfigured."""
+    if not is_configured():
+        return None
+    try:
+        rows = await _get("bt_config", {"select": "value", "key": f"eq.{key}", "limit": "1"})
+    except Exception:
+        return None
+    return rows[0]["value"] if rows else None
+
+
+async def get_log_chat_id() -> int | None:
+    raw = await get_config("log_chat_id")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 async def display_names(tg_ids: list[int]) -> dict[int, str]:
     if not tg_ids:
         return {}

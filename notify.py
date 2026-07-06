@@ -27,6 +27,20 @@ def esc(text: object) -> str:
     return html.escape(str(text if text is not None else ""))
 
 
+def profile_link(tg_id: int, username: str | None, name: str | None) -> str:
+    """HTML anchor to a user's Telegram profile.
+
+    Prefers a public ``https://t.me/<username>`` link; falls back to a
+    ``tg://user?id=`` deep link when the user has no username.
+    """
+    label = esc((name or "").strip() or (f"@{username}" if username else str(tg_id)))
+    if username:
+        href = f"https://t.me/{username.lstrip('@')}"
+    else:
+        href = f"tg://user?id={tg_id}"
+    return f'<a href="{href}">{label}</a>'
+
+
 async def send_dm(tg_id: int, text: str) -> bool:
     """Send an HTML DM to ``tg_id``. Returns True on success, False otherwise.
 
