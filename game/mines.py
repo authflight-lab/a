@@ -27,8 +27,9 @@ EDGE_RAMP = 0.13
 EDGE_DECAY = 0.6
 
 # Flat scale on every mines multiplier (the progression was scaling too fast).
-# 0.90 => all multipliers 10% lower; set to 1.0 to remove the reduction.
-MULT_SCALE = 0.90
+# 0.765 => all multipliers 23.5% lower vs the original; set to 1.0 to remove.
+# 0.90 was the previous value; 0.90 * 0.85 = 0.765 (−15% from "now" state).
+MULT_SCALE = 0.765
 
 
 def edge(k: int) -> float:
