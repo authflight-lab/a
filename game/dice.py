@@ -1,7 +1,7 @@
 """Dice — single-settle (spec §7.1).
 
-    M_dice(T) = (1 - EPS) * 100 / T,   T in [2, 98]
-    Roll R = rng_float * 100. Win if R < T.
+    M_dice(T) = (1 - EPS) * 100 / (100 - T),   T in [2, 98]
+    Roll R = rng_float * 100. Win if R > T.
 """
 
 from . import EPS
@@ -12,7 +12,7 @@ T_MAX = 98
 
 
 def multiplier(target: int) -> float:
-    return (1 - EPS) * 100.0 / target
+    return (1 - EPS) * 100.0 / (100 - target)
 
 
 def valid_target(target: int) -> bool:
@@ -21,7 +21,7 @@ def valid_target(target: int) -> bool:
 
 def settle(server_seed: str, client_seed: str, nonce: int, target: int) -> dict:
     roll = rng_float(server_seed, client_seed, nonce, 0) * 100.0
-    win = roll < target
+    win = roll > target
     return {
         "target": target,
         "roll": roll,
@@ -31,6 +31,6 @@ def settle(server_seed: str, client_seed: str, nonce: int, target: int) -> dict:
 
 
 def rtp_distribution(target: int) -> list[tuple[float, float]]:
-    """[(P(win), M), (P(lose), 0)] — R uniform on [0, 100) so P(win) = T/100."""
-    p_win = target / 100.0
+    """[(P(win), M), (P(lose), 0)] — R uniform on [0, 100) so P(win) = (100 - T)/100."""
+    p_win = (100 - target) / 100.0
     return [(p_win, multiplier(target)), (1.0 - p_win, 0.0)]

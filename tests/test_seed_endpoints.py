@@ -322,7 +322,8 @@ def test_highlow_skip_keeps_multiplier_and_advances_deterministically(client):
     assert skip2.json()["multiplier"] == 1.0
     assert client.fake.rounds[rid]["outcome"]["step"] == 2
 
-    # Round is still open, so the player can still cash out the bet (1.0x).
+    # Skips alone don't unlock cashout: at least one real pick is required, so a
+    # skip-only round is rejected with must_pick_first (round stays open).
     cash = client.post("/bt/api/game/highlow/cashout", json={"round_id": rid})
-    assert cash.status_code == 200
-    assert "server_seed" not in cash.json()
+    assert cash.status_code == 400
+    assert cash.json().get("error") == "must_pick_first"

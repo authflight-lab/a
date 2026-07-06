@@ -96,8 +96,10 @@ async def _cashout_stale_round(rnd: dict) -> None:
                 outcome = {"floor": floor, "difficulty": difficulty, "multiplier": mult}
         else:  # highlow
             step_n = int(state.get("step", 0))
-            if step_n == 0:
-                mult, outcome = 0.0, {"step": 0, "multiplier": 0.0}
+            # Skips advance `step` but not `picks`; a skip-only round has made no
+            # real wager decision, so it settles at 0 just like the cashout gate.
+            if int(state.get("picks", 0)) < 1:
+                mult, outcome = 0.0, {"step": step_n, "multiplier": 0.0}
             else:
                 mult = min(float(state.get("multiplier", 1.0)), MULT_CAP)
                 outcome = {"step": step_n, "rank": int(state.get("rank", 0)), "multiplier": mult}
@@ -905,19 +907,26 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
     r = int(state.get("rank", 0))
     step_n = int(state.get("step", 0))
     cur_mult = float(state.get("multiplier", 1.0))
+    skips = int(state.get("skips", 0))
+    picks = int(state.get("picks", 0))
     draw = lambda i: rng_float(ss, cs, nonce, i)
     slot = step_n + 1
     # Skip: swap the current decision card for a fresh one without wagering. The
     # chain multiplier is unchanged and a new slot is consumed so the draw stays
-    # provably deterministic. This is EV-neutral — every guess pays EV = 1 - HL_EPS
-    # regardless of the card — so unlimited skips can't be exploited.
+    # provably deterministic. Capped at 5 skips in a row — after that a side must
+    # be picked; a real pick resets the allowance.
     if guess == "skip" or (isinstance(move, dict) and move.get("skip")):
+        if skips >= 5:
+            return _err("skip_limit")
         new_rank = highlow.current_card(draw, slot)
-        new_state = {"rank": new_rank, "step": step_n + 1, "multiplier": cur_mult}
+        new_skips = skips + 1
+        new_state = {"rank": new_rank, "step": step_n + 1, "multiplier": cur_mult,
+                     "skips": new_skips, "picks": picks}
         await db.update_round(rnd["id"], {"outcome": new_state})
         return {"outcome_step": {"current": new_rank, "prev": r, "guess": "skip",
-                                 "skipped": True, "win": True},
-                "multiplier": cur_mult, "can_cashout": True, "busted": False, "done": False}
+                                 "skipped": True, "win": True, "skips": new_skips},
+                "multiplier": cur_mult, "can_cashout": picks >= 1, "skips": new_skips,
+                "busted": False, "done": False}
     if (guess not in ("higher", "lower") or not highlow.can_pick(guess, r)
             or not highlow.within_cap(cur_mult, guess, r)):
         return _err("invalid_move")
@@ -932,10 +941,12 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
     # Wild reveal (Ace/King) passes through to the next non-wild card, which
     # becomes the new current decision card; a normal card is itself the current.
     new_rank = drawn if not highlow.is_wild(drawn) else highlow.current_card(draw, slot, start_j=1)
-    new_state = {"rank": new_rank, "step": step_n + 1, "multiplier": new_mult}
+    # A real pick resets the skip allowance and counts toward the cashout minimum.
+    new_state = {"rank": new_rank, "step": step_n + 1, "multiplier": new_mult,
+                 "skips": 0, "picks": picks + 1}
     await db.update_round(rnd["id"], {"outcome": new_state})
     return {"outcome_step": {"drawn": drawn, "current": new_rank, "prev": r, "guess": guess, "win": True},
-            "multiplier": new_mult, "can_cashout": True, "busted": False, "done": False}
+            "multiplier": new_mult, "can_cashout": True, "skips": 0, "busted": False, "done": False}
 
 
 @app.post("/bt/api/game/{name}/cashout")
@@ -981,6 +992,10 @@ async def game_cashout(name: str, user: dict = Depends(require_user), body: dict
         outcome = {"floor": floor, "difficulty": difficulty, "multiplier": mult}
     else:  # highlow
         step_n = int(state.get("step", 0))
+        # Must make at least one real pick before cashing out (skips don't count),
+        # so a bet can't be cashed straight back at the 1.0x baseline.
+        if int(state.get("picks", 0)) < 1:
+            return _err("must_pick_first")
         mult = min(float(state.get("multiplier", 1.0)), MULT_CAP)
         outcome = {"step": step_n, "rank": int(state.get("rank", 0)), "multiplier": mult}
 
