@@ -255,6 +255,9 @@ async def me(user: dict = Depends(require_user)):
         "quest": {"day": day, "chatted": chatted, "claimed": claimed},
         "can_redeem": chatted and claimed,
         "age_ack": bool(meta.get("age_ack", False)),
+        # @partygc name-tag perk (drives the gold home-screen badge). The bot
+        # owns activation/verification; the app just reflects the stored flag.
+        "multiplier_active": bool(u.get("name_multiplier", False)),
     }
 
 
