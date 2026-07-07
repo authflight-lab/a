@@ -11,8 +11,9 @@ Required in production:
   - BOT_TOKEN                — Telegram bot token (for initData HMAC validation)
   - BT_SUPABASE_URL          — Supabase project URL
   - BT_SUPABASE_SERVICE_KEY  — Supabase service-role key (server-side authority)
-  - BT_APP_ORIGIN            — exact Mini App origin for the CORS allowlist,
-                               e.g. https://app.partygc.online
+  - BT_APP_ORIGIN            — Mini App origin(s) for the CORS allowlist. One or
+                               more EXACT origins, comma-separated, e.g.
+                               https://app.partygc.online,https://foo.pages.dev
 
 Reading settings performs NO network I/O.
 """

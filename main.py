@@ -122,8 +122,10 @@ async def _start_sweeper() -> None:
 
 logger = logging.getLogger("bt.api")
 
-# CORS: explicit allowlist = BT_APP_ORIGIN only. Never a wildcard (spec §8).
-_origins = [settings.bt_app_origin] if settings.bt_app_origin else []
+# CORS: explicit allowlist from BT_APP_ORIGIN. Never a wildcard (spec §8).
+# BT_APP_ORIGIN may list several exact origins separated by commas (e.g. the
+# custom domain plus the raw *.pages.dev URL) — each is matched exactly.
+_origins = [o.strip() for o in settings.bt_app_origin.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins,
