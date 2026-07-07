@@ -300,31 +300,36 @@ async def me(user: dict = Depends(require_user)):
             tg_id, user.get("username"), user.get("display_name"), cached_row=u
         )
     day = _today()
-    quest = await db.get_quest(tg_id, day) or {"day": day, "chatted": False, "claimed": False}
-    chatted = bool(quest.get("chatted", False))
-    claimed = bool(quest.get("claimed", False))
     meta = u.get("meta") or {}
     raw_backlog = int(u.get("backlog_pts", 0))
     bal = int(u.get("balance", 0))
 
+    # The quest row and the stats card come from independent reads, so fetch them
+    # concurrently to collapse the sequential PostgREST round-trips into a single
+    # wall-clock wait. The quest is always needed; the stats card is only computed
+    # once the backlog is cleared (registered & claimed).
+    need_stats = raw_backlog == 0
+    jobs: list = [db.get_quest(tg_id, day)]
+    if need_stats:
+        jobs += [db.user_stats(tg_id), db.rich_rank(tg_id, bal)]
+    results = await asyncio.gather(*jobs, return_exceptions=True)
+
+    q = results[0]
+    quest = q if isinstance(q, dict) else {"day": day, "chatted": False, "claimed": False}
+    chatted = bool(quest.get("chatted", False))
+    claimed = bool(quest.get("claimed", False))
+
     # Stats card: only computed when backlog is cleared (registered & claimed).
     activity: dict | None = None
-    if raw_backlog == 0:
-        try:
-            us, rr = await asyncio.gather(
-                db.user_stats(tg_id),
-                db.rich_rank(tg_id, bal),
-                return_exceptions=True,
-            )
-            if isinstance(us, dict) and not isinstance(rr, Exception):
-                activity = {
-                    "messages_sent": int(us.get("messages_sent", 0)),
-                    "amount_wagered": int(us.get("amount_wagered", 0)),
-                    "messages_rank": int(us.get("messages_rank", 1)),
-                    "rich_rank": int(rr),
-                }
-        except Exception:
-            pass
+    if need_stats:
+        us, rr = results[1], results[2]
+        if isinstance(us, dict) and not isinstance(rr, Exception):
+            activity = {
+                "messages_sent": int(us.get("messages_sent", 0)),
+                "amount_wagered": int(us.get("amount_wagered", 0)),
+                "messages_rank": int(us.get("messages_rank", 1)),
+                "rich_rank": int(rr),
+            }
 
     return {
         "tg_id": tg_id,
