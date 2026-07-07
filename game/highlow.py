@@ -22,9 +22,9 @@ Two guards keep payouts sane for a points economy:
 
 from . import MULT_CAP
 
-# HighLow-specific house edge (5%). Larger than the global EPS (1%) on purpose;
+# HighLow-specific house edge (2%). Slightly larger than the global EPS (1%);
 # other games are unaffected.
-HL_EPS = 0.05
+HL_EPS = 0.02
 
 RANKS = 13
 
