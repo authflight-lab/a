@@ -19,11 +19,11 @@ import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
-from fastapi import Body, Depends, FastAPI, HTTPException, Request
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from . import db, notify, ratelimit
+from . import db, notify, pgpool, ratelimit
 from .auth import require_user
 from .config import settings
 from .db import InsufficientBalance, SupabaseNotConfigured
@@ -120,6 +120,11 @@ async def _stale_round_sweeper_loop() -> None:
 @app.on_event("startup")
 async def _start_sweeper() -> None:
     asyncio.create_task(_stale_round_sweeper_loop())
+
+
+@app.on_event("shutdown")
+async def _close_pgpool() -> None:
+    await pgpool.close_pool()
 
 logger = logging.getLogger("bt.api")
 # Ensure request-timing (INFO) lines reach stdout in the Render logs regardless
@@ -269,6 +274,62 @@ def _rl_err(retry_after: int) -> JSONResponse:
 @app.get("/bt/api/health")
 async def health():
     return {"ok": True, "configured": db.is_configured()}
+
+
+# ---------------------------------------------------------------------------
+# TEMPORARY spike probe (point 2): measure PostgREST vs direct asyncpg latency
+# for the SAME hot read, on Render (co-located with Supabase), before deciding
+# whether to migrate any hot path off the REST hop. Read-only, returns timings
+# only. Gated by a token passed in the X-Probe-Token HEADER (kept out of query
+# strings/access logs) and rate-limited to blunt DB-load abuse. Remove once the
+# spike question is answered.
+# ---------------------------------------------------------------------------
+_PROBE_TOKEN = "bt-spike-7719"
+
+
+@app.get("/bt/api/_pgprobe")
+async def pgprobe(n: int = 20, x_probe_token: str = Header("")):
+    if x_probe_token != _PROBE_TOKEN:
+        raise HTTPException(status_code=404)
+    allowed, retry_after = ratelimit.check("pgprobe", limit=20, window_sec=60)
+    if not allowed:
+        return _rl_err(retry_after)
+    n = max(1, min(n, 100))
+    sample = 8243604458  # owner tg_id — known to exist
+
+    async def _rest() -> None:
+        await db.get_user(sample)
+
+    pool = await pgpool.get_pool()
+
+    async def _pg() -> None:
+        async with pool.acquire() as c:
+            await c.fetchrow("select * from bt_users where tg_id = $1", sample)
+
+    async def _bench(fn) -> dict:
+        for _ in range(3):  # warmup (connection + plan cache)
+            await fn()
+        xs: list[float] = []
+        for _ in range(n):
+            s = time.perf_counter()
+            await fn()
+            xs.append((time.perf_counter() - s) * 1000)
+        xs.sort()
+        k = len(xs)
+        return {
+            "min": round(xs[0], 2),
+            "median": round(xs[k // 2], 2),
+            "avg": round(sum(xs) / k, 2),
+            "p95": round(xs[min(k - 1, int(k * 0.95))], 2),
+            "max": round(xs[-1], 2),
+        }
+
+    return {
+        "n": n,
+        "sample": sample,
+        "postgrest": await _bench(_rest),
+        "asyncpg_pool": await _bench(_pg),
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -28,6 +28,17 @@ class Settings:
     bot_token: str = ""
     bt_supabase_url: str = ""
     bt_supabase_service_key: str = ""
+    # HARDCODED (user request): direct Postgres DSN for the asyncpg pool, used to
+    # bypass the PostgREST HTTP hop on hot reads. This is the Supavisor SESSION
+    # pooler (port 5432, IPv4, statement caching disabled pool-side) for the same
+    # Supabase project as bt_supabase_url. The '*' in the password is %2A-encoded
+    # so the DSN parses. An env var of the same name (BT_SUPABASE_DB_URL) overrides
+    # it when present. NOTE: putting a DB password in source makes this repo as
+    # sensitive as the database itself.
+    bt_supabase_db_url: str = (
+        "postgresql://postgres.jbtakenwtinlipbgrujm:zetro552020%2A"
+        "@aws-0-us-east-1.pooler.supabase.com:5432/postgres?sslmode=require"
+    )
     # Exact origin of the deployed Mini App; the CORS allowlist is built from this.
     bt_app_origin: str = ""
 
