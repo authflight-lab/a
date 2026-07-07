@@ -215,7 +215,7 @@ async def redeem(tg_id: int, reward_id: str, period: str) -> dict:
             body = r.text
         except Exception:
             pass
-        for code in ("insufficient_balance", "monthly_limit_reached", "reward_inactive"):
+        for code in ("insufficient_balance", "monthly_limit_reached", "daily_limit_reached", "reward_inactive"):
             if code in body:
                 raise RedeemError(code)
         if "reward_not_found" in body:
@@ -429,6 +429,20 @@ async def decr_reward_usage(reward_id: str, period: str) -> None:
 async def create_redemption(tg_id: int, reward_id: str, cost: int) -> dict | None:
     return await _insert("bt_redemptions",
                          {"tg_id": tg_id, "reward_id": reward_id, "cost": cost, "status": "pending"})
+
+
+async def has_redeemed_today(tg_id: int, day_start_iso: str) -> bool:
+    """True if the user already has a non-rejected redemption since ``day_start_iso``
+    (UTC midnight). Rejected redemptions are auto-refunded, so they do not count
+    against the one-reward-per-day limit."""
+    rows = await _get("bt_redemptions", {
+        "tg_id": f"eq.{tg_id}",
+        "created_at": f"gte.{day_start_iso}",
+        "status": "neq.rejected",
+        "select": "id",
+        "limit": "1",
+    })
+    return bool(rows)
 
 
 # ---------------------------------------------------------------------------

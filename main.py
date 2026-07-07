@@ -541,6 +541,11 @@ async def redeem(user: dict = Depends(require_user), body: dict | None = Body(de
     if not (quest and quest.get("chatted") and quest.get("claimed")):
         return {"ok": False, "error": "activity_floor_not_met"}
 
+    # One reward claim per UTC day. Rejected redemptions are auto-refunded and
+    # excluded, so a denied claim never burns the user's day.
+    if await db.has_redeemed_today(tg_id, _utc_day_start()):
+        return {"ok": False, "error": "daily_limit_reached"}
+
     # Atomic debit + monthly-usage increment + redemption row (spec §14) via the
     # bt_redeem RPC — reward/active/monthly-limit/balance are all enforced inside
     # one transaction, closing the read-then-write race on monthly_limit.
