@@ -690,9 +690,13 @@ async def game_bet(name: str, user: dict = Depends(require_user), body: dict | N
     if u is None:
         u = await db.upsert_user(tg_id, user.get("username"), user.get("display_name")) or {}
     balance = int(u.get("balance", 0))
-    max_bet = min(BET_MAX, balance)
-    if bet < BET_MIN or bet > max_bet:
+    # Distinguish a genuinely invalid stake (below the min or above the table
+    # cap) from simply not having enough points, so the client can show a
+    # "balance too low" message instead of a generic invalid-bet error.
+    if bet < BET_MIN or bet > BET_MAX:
         return {"ok": False, "error": "invalid_bet"}
+    if bet > balance:
+        return {"ok": False, "error": "insufficient_balance"}
 
     # One open round per (user, game) (unique index bt_one_open_round is the backstop).
     if await db.get_open_round(tg_id, name):
