@@ -1,16 +1,15 @@
 [build-system]
 requires = ["setuptools>=61"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "bartender-api"
 version = "1.0.0"
 requires-python = ">=3.11"
 
-[tool.setuptools.packages]
-find = {where = [".."], include = ["api*"]}
+[tool.setuptools]
+packages = ["api", "api.game"]
 
 [tool.setuptools.package-dir]
 "api" = "."
 "api.game" = "game"
-"api.tests" = "tests"
