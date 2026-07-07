@@ -216,6 +216,54 @@ def test_bet_and_settle_never_leak_active_server_seed(client):
     assert s["server_hash"] == b["server_hash"]  # only the commitment, never the seed
 
 
+def test_new_bet_auto_voids_and_refunds_a_leftover_open_round(client):
+    # A leftover open round (crashed/abandoned client) must never block a new bet
+    # with open_round_exists: it is voided, its bet refunded, and the new round
+    # opens. Balance nets out to a single stake for the fresh round.
+    fake = client.fake
+    fake.users[1] = {"tg_id": 1, "balance": 1000}
+
+    first = client.post("/bt/api/game/mines/bet",
+                        json={"bet": 100, "params": {"mines": 3}})
+    assert first.status_code == 200
+    old_rid = first.json()["round_id"]
+    assert fake.users[1]["balance"] == 900          # first stake debited
+
+    # Second bet WITHOUT settling the first — the straggler is purged + refunded.
+    second = client.post("/bt/api/game/mines/bet",
+                         json={"bet": 100, "params": {"mines": 3}})
+    assert second.status_code == 200
+    body = second.json()
+    assert body.get("error") is None                # no open_round_exists surfaced
+    new_rid = body["round_id"]
+    assert new_rid != old_rid
+
+    # Old round is closed as 'voided' with its bet refunded; only one round open.
+    assert fake.rounds[old_rid]["status"] == "voided"
+    assert fake.rounds[old_rid]["payout"] == 100
+    assert fake.rounds[new_rid]["status"] == "open"
+    # Net balance: refund (+100) of the old stake then debit (-100) of the new one.
+    assert fake.users[1]["balance"] == 900
+
+
+def test_refund_lets_a_stuck_round_free_a_bet_the_user_could_not_afford(client):
+    # If the leftover stake left the user unable to afford the next bet, the refund
+    # (applied before the balance check) restores the funds so the new bet opens.
+    fake = client.fake
+    fake.users[1] = {"tg_id": 1, "balance": 100}
+
+    first = client.post("/bt/api/game/mines/bet",
+                        json={"bet": 100, "params": {"mines": 3}})
+    assert first.status_code == 200
+    assert fake.users[1]["balance"] == 0            # all-in on the first round
+
+    second = client.post("/bt/api/game/mines/bet",
+                         json={"bet": 100, "params": {"mines": 3}})
+    assert second.status_code == 200
+    assert second.json().get("error") is None       # refund funded the new bet
+    assert fake.users[1]["balance"] == 0
+
+
 def test_play_one_shot_opens_and_settles_in_a_single_call(client):
     # /play opens AND settles a single-settle game in one request, returning the
     # settle outcome plus the bet-side hash/nonce — and never the active seed.

@@ -805,6 +805,15 @@ async def _open_bet(name: str, user: dict, body: dict | None):
     if not ok:
         return None, None, _err("invalid_params")
 
+    # One open round per (user, game). Rather than reject a new bet when a
+    # leftover round is still open (a crashed/abandoned client, a lost settle),
+    # auto-purge it and refund its bet, then continue opening the fresh round —
+    # "open_round_exists" must never surface to the user. Done BEFORE the balance
+    # read below so the refunded points count toward affording the new bet.
+    existing = await db.get_open_round(tg_id, name)
+    if existing:
+        await _void_open_round(existing, tg_id)
+
     u = await db.get_user(tg_id)
     if u is None:
         u = await db.upsert_user(tg_id, user.get("username"), user.get("display_name")) or {}
@@ -816,10 +825,6 @@ async def _open_bet(name: str, user: dict, body: dict | None):
         return None, None, {"ok": False, "error": "invalid_bet"}
     if bet > balance:
         return None, None, {"ok": False, "error": "insufficient_balance"}
-
-    # One open round per (user, game) (unique index bt_one_open_round is the backstop).
-    if await db.get_open_round(tg_id, name):
-        return None, None, {"ok": False, "error": "open_round_exists"}
 
     # Reuse the user's active seed pair (Rainbet-style): the server & client
     # seeds persist across bets and only the per-pair nonce advances. The active
@@ -849,7 +854,14 @@ async def _open_bet(name: str, user: dict, body: dict | None):
         except InsufficientBalance:
             return None, None, {"ok": False, "error": "insufficient_balance"}
         except db.OpenRoundExists:
-            return None, None, {"ok": False, "error": "open_round_exists"}
+            # A round was opened concurrently (or the pre-check above raced) after
+            # we purged. Void + refund the straggler and retry within the loop so
+            # the user never sees open_round_exists; falls through to try_again
+            # only if we exhaust the retries.
+            leftover = await db.get_open_round(tg_id, name)
+            if leftover:
+                await _void_open_round(leftover, tg_id)
+            continue
         except db.NonceConflict:
             refreshed = await db.get_seed_pair(tg_id)
             if not refreshed:
@@ -986,6 +998,30 @@ async def _finalise(rnd: dict, tg_id: int, multiplier: float, status: str, outco
         "new_balance": int(res.get("new_balance", 0)),
         "server_hash": rnd["server_hash"],
     }
+
+
+async def _void_open_round(rnd: dict, tg_id: int) -> None:
+    """Purge a leftover open round and refund its full bet — best-effort.
+
+    Reuses the atomic ``bt_settle_round`` RPC (close + credit in one guarded
+    transaction) with ``payout = bet`` and ``status = 'voided'``, so the refund
+    is idempotent (a concurrent settle finds the round already closed and credits
+    nothing) and crash-safe (the credit either commits with the close or not at
+    all). Because the credit exactly offsets the round's ``game_bet`` outflow, the
+    round nets to zero — no house profit, no phantom loss — which keeps the /stats
+    house-edge math correct even though the credit is recorded as a game payout.
+
+    Never raises: a stuck round must never surface ``open_round_exists`` to the
+    user, so any failure here is logged and swallowed and the caller proceeds.
+    """
+    try:
+        bet = int(rnd.get("bet", 0))
+        await db.settle_round(rnd["id"], tg_id, rnd.get("outcome") or {}, bet, "voided")
+        logger.info("open_round_voided round=%s tg_id=%s refund=%s", rnd.get("id"), tg_id, bet)
+    except Exception as exc:  # noqa: BLE001 — never block a new bet on a purge failure
+        logger.warning("void_open_round_failed round=%s: %s", rnd.get("id"), exc)
+    finally:
+        _round_cache_pop(rnd.get("id"))
 
 
 @app.post("/bt/api/game/{name}/settle")
