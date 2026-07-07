@@ -15,13 +15,16 @@ Balance is derived (``balance == sum(bt_ledger.amount)``). All balance changes g
 through the ``bt_apply_ledger`` RPC exclusively — never a raw ``UPDATE balance``.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any
+from uuid import UUID
 
+import asyncpg
 import httpx
 
 from .config import settings
-from . import cache
+from . import cache, pgpool
 
 
 class SupabaseNotConfigured(Exception):
@@ -92,6 +95,31 @@ async def aclose() -> None:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# asyncpg row normalisation — make a direct-DB row match the PostgREST JSON
+# shape so pg-first and REST-fallback paths return identical dicts. asyncpg
+# hands back native Python types (UUID, datetime, Decimal); we render them the
+# way PostgREST would (uuid/timestamp as strings, integral numeric as int).
+# jsonb columns already arrive as dict/list via the pool's type codec.
+# ---------------------------------------------------------------------------
+
+def _norm(v: Any) -> Any:
+    if isinstance(v, UUID):
+        return str(v)
+    if isinstance(v, (datetime, date)):
+        return v.isoformat()
+    if isinstance(v, Decimal):
+        i = int(v)
+        return i if v == i else float(v)
+    return v
+
+
+def _row(rec: "asyncpg.Record | None") -> dict | None:
+    if rec is None:
+        return None
+    return {k: _norm(v) for k, v in rec.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -216,9 +244,22 @@ def _invalidate_user(tg_id: int) -> None:
     cache.invalidate(_user_key(tg_id))
 
 
-async def get_user(tg_id: int) -> dict | None:
+async def _get_user_rest(tg_id: int) -> dict | None:
     rows = await _get("bt_users", {"tg_id": f"eq.{tg_id}", "select": "*", "limit": "1"})
     return rows[0] if rows else None
+
+
+async def get_user(tg_id: int) -> dict | None:
+    """Read a user row (direct-DB, REST fallback on any pool/transport failure)."""
+    try:
+        pool = await pgpool.get_pool()
+        rec = await pool.fetchrow(
+            "select * from bt_users where tg_id = $1 limit 1", tg_id)
+        return _row(rec)
+    except Exception as e:  # noqa: BLE001 — classify then fall back or re-raise
+        if pgpool.should_fallback(e):
+            return await _get_user_rest(tg_id)
+        raise
 
 
 async def get_user_cached(tg_id: int) -> dict | None:
@@ -394,15 +435,25 @@ async def create_redemption(tg_id: int, reward_id: str, cost: int) -> dict | Non
 # Seed pairs (provably-fair, Rainbet-style reuse; see api/game/seedpair.py)
 # ---------------------------------------------------------------------------
 
-async def get_seed_pair(tg_id: int) -> dict | None:
+async def _get_seed_pair_rest(tg_id: int) -> dict | None:
     rows = await _get("bt_seed_pairs", {"tg_id": f"eq.{tg_id}", "select": "*", "limit": "1"})
     return rows[0] if rows else None
 
 
-async def create_seed_pair(tg_id: int, pair: dict) -> dict | None:
-    """Insert the active seed pair only if absent — ``ignore-duplicates`` so two
-    concurrent first-bets can't both create one (TOCTOU-safe). Returns the row
-    that ends up stored (the winner's, if we lost the race)."""
+async def get_seed_pair(tg_id: int) -> dict | None:
+    """Read the user's active seed pair (direct-DB, REST fallback)."""
+    try:
+        pool = await pgpool.get_pool()
+        rec = await pool.fetchrow(
+            "select * from bt_seed_pairs where tg_id = $1 limit 1", tg_id)
+        return _row(rec)
+    except Exception as e:  # noqa: BLE001
+        if pgpool.should_fallback(e):
+            return await _get_seed_pair_rest(tg_id)
+        raise
+
+
+async def _create_seed_pair_rest(tg_id: int, pair: dict) -> dict | None:
     client = _get_client()
     row = {"tg_id": tg_id, **pair, "updated_at": _now()}
     r = await client.post(
@@ -418,7 +469,33 @@ async def create_seed_pair(tg_id: int, pair: dict) -> dict | None:
     if data:
         return data
     # Row already existed (insert ignored) → read the winner back.
-    return await get_seed_pair(tg_id)
+    return await _get_seed_pair_rest(tg_id)
+
+
+async def create_seed_pair(tg_id: int, pair: dict) -> dict | None:
+    """Insert the active seed pair only if absent — ``on conflict do nothing`` so
+    two concurrent first-bets can't both create one (TOCTOU-safe). Returns the row
+    that ends up stored (the winner's, if we lost the race). Direct-DB with REST
+    fallback on any pool/transport failure."""
+    data = {"tg_id": tg_id, **pair, "updated_at": datetime.now(timezone.utc)}
+    cols = list(data.keys())
+    placeholders = ", ".join(f"${i + 1}" for i in range(len(cols)))
+    vals = [data[c] for c in cols]
+    sql = (f'insert into bt_seed_pairs ({", ".join(cols)}) '
+           f'values ({placeholders}) on conflict (tg_id) do nothing returning *')
+    try:
+        pool = await pgpool.get_pool()
+        async with pool.acquire() as con:
+            rec = await con.fetchrow(sql, *vals)
+            if rec is None:
+                # Insert ignored (row already existed) → read the winner back.
+                rec = await con.fetchrow(
+                    "select * from bt_seed_pairs where tg_id = $1", tg_id)
+            return _row(rec)
+    except Exception as e:  # noqa: BLE001
+        if pgpool.should_fallback(e):
+            return await _create_seed_pair_rest(tg_id, pair)
+        raise
 
 
 async def open_round(tg_id: int, game: str, bet: int, expected_nonce: int,
@@ -433,6 +510,37 @@ async def open_round(tg_id: int, game: str, bet: int, expected_nonce: int,
     Raises ``NonceConflict`` (retry with a fresh nonce), ``OpenRoundExists``
     (a round for this game is already open), or ``InsufficientBalance``.
     """
+    try:
+        pool = await pgpool.get_pool()
+    except Exception as e:  # noqa: BLE001 — pool unavailable → REST
+        if pgpool.should_fallback(e):
+            return await _open_round_rest(tg_id, game, bet, expected_nonce, params, outcome)
+        raise
+    try:
+        val = await pool.fetchval(
+            "select bt_open_round($1, $2, $3, $4, $5, $6)",
+            tg_id, game, bet, expected_nonce, params, outcome or {})
+    except asyncpg.exceptions.RaiseError as re:
+        # The RPC raises plain messages; map them to the same domain exceptions
+        # the REST path raised from the response body.
+        msg = getattr(re, "message", "") or str(re)
+        if "nonce_conflict" in msg:
+            raise NonceConflict()
+        if "open_round_exists" in msg:
+            raise OpenRoundExists()
+        if "insufficient_balance" in msg:
+            raise InsufficientBalance("insufficient_balance")
+        raise SupabaseError(f"open_round failed: {msg}")
+    except Exception as e:  # noqa: BLE001 — transport failure → REST
+        if pgpool.should_fallback(e):
+            return await _open_round_rest(tg_id, game, bet, expected_nonce, params, outcome)
+        raise
+    _invalidate_user(tg_id)
+    return val
+
+
+async def _open_round_rest(tg_id: int, game: str, bet: int, expected_nonce: int,
+                           params: dict, outcome: dict | None) -> dict:
     client = _get_client()
     payload = {
         "p_tg_id": tg_id,
@@ -502,16 +610,44 @@ async def get_stale_open_rounds(minutes: int = 30) -> list[dict]:
                       {"status": "eq.open", "created_at": f"lt.{cutoff}", "select": "*", "limit": "200"})
 
 
-async def get_open_round(tg_id: int, game: str) -> dict | None:
+async def _get_open_round_rest(tg_id: int, game: str) -> dict | None:
     rows = await _get("bt_game_rounds",
                       {"tg_id": f"eq.{tg_id}", "game": f"eq.{game}", "status": "eq.open",
                        "select": "*", "limit": "1"})
     return rows[0] if rows else None
 
 
-async def get_round(round_id: str) -> dict | None:
+async def get_open_round(tg_id: int, game: str) -> dict | None:
+    """The user's currently-open round for ``game`` (direct-DB, REST fallback)."""
+    try:
+        pool = await pgpool.get_pool()
+        rec = await pool.fetchrow(
+            "select * from bt_game_rounds "
+            "where tg_id = $1 and game = $2 and status = 'open' limit 1",
+            tg_id, game)
+        return _row(rec)
+    except Exception as e:  # noqa: BLE001
+        if pgpool.should_fallback(e):
+            return await _get_open_round_rest(tg_id, game)
+        raise
+
+
+async def _get_round_rest(round_id: str) -> dict | None:
     rows = await _get("bt_game_rounds", {"id": f"eq.{round_id}", "select": "*", "limit": "1"})
     return rows[0] if rows else None
+
+
+async def get_round(round_id: str) -> dict | None:
+    """Read a round by id (direct-DB, REST fallback)."""
+    try:
+        pool = await pgpool.get_pool()
+        rec = await pool.fetchrow(
+            "select * from bt_game_rounds where id = $1::uuid limit 1", str(round_id))
+        return _row(rec)
+    except Exception as e:  # noqa: BLE001
+        if pgpool.should_fallback(e):
+            return await _get_round_rest(round_id)
+        raise
 
 
 async def create_round(tg_id: int, game: str, bet: int, server_seed: str, server_hash: str,
@@ -545,16 +681,32 @@ async def close_round(round_id: str, patch: dict) -> dict | None:
                         {"id": f"eq.{round_id}", "status": "eq.open"}, patch)
 
 
+async def _update_open_round_rest(round_id: str, patch: dict) -> dict | None:
+    return await _patch("bt_game_rounds",
+                        {"id": f"eq.{round_id}", "status": "eq.open"}, patch)
+
+
 async def update_open_round(round_id: str, patch: dict) -> dict | None:
     """PATCH a round's mutable state guarded on ``status='open'``.
 
     Returns the updated row, or ``None`` if the round is no longer open (settled
     by a concurrent cashout/bust, or swept as timed-out). Lets a caller working
     from an in-process cache detect a stale entry and fall back correctly instead
-    of reviving a closed round.
+    of reviving a closed round. Direct-DB with REST fallback on pool failure.
     """
-    return await _patch("bt_game_rounds",
-                        {"id": f"eq.{round_id}", "status": "eq.open"}, patch)
+    keys = list(patch.keys())
+    set_clause = ", ".join(f"{k} = ${i + 2}" for i, k in enumerate(keys))
+    vals = [patch[k] for k in keys]
+    sql = (f"update bt_game_rounds set {set_clause} "
+           f"where id = $1::uuid and status = 'open' returning *")
+    try:
+        pool = await pgpool.get_pool()
+        rec = await pool.fetchrow(sql, str(round_id), *vals)
+        return _row(rec)
+    except Exception as e:  # noqa: BLE001
+        if pgpool.should_fallback(e):
+            return await _update_open_round_rest(round_id, patch)
+        raise
 
 
 async def settle_round(round_id: str, tg_id: int, outcome: dict, payout: int,
@@ -566,6 +718,30 @@ async def settle_round(round_id: str, tg_id: int, outcome: dict, payout: int,
     Guarded on ``status='open'`` server-side, so a concurrent double-settle
     returns ``closed=False`` and credits nothing (idempotent).
     """
+    try:
+        pool = await pgpool.get_pool()
+    except Exception as e:  # noqa: BLE001 — pool unavailable → REST
+        if pgpool.should_fallback(e):
+            return await _settle_round_rest(round_id, tg_id, outcome, payout, status)
+        raise
+    try:
+        val = await pool.fetchval(
+            "select bt_settle_round($1::uuid, $2, $3, $4, $5)",
+            str(round_id), tg_id, outcome, payout, status)
+    except asyncpg.PostgresError as pe:
+        # A server-reported error is a real failure (never fall back and risk a
+        # double credit); surface it the same way the REST path did.
+        raise SupabaseError(f"settle_round failed: {pe}")
+    except Exception as e:  # noqa: BLE001 — transport failure → REST
+        if pgpool.should_fallback(e):
+            return await _settle_round_rest(round_id, tg_id, outcome, payout, status)
+        raise
+    _invalidate_user(tg_id)
+    return val
+
+
+async def _settle_round_rest(round_id: str, tg_id: int, outcome: dict, payout: int,
+                             status: str) -> dict:
     client = _get_client()
     payload = {
         "p_round_id": round_id,
