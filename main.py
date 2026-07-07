@@ -122,16 +122,17 @@ async def _start_sweeper() -> None:
 
 logger = logging.getLogger("bt.api")
 
-# CORS: explicit allowlist from BT_APP_ORIGIN. Never a wildcard (spec §8).
-# BT_APP_ORIGIN may list several exact origins separated by commas (e.g. the
-# custom domain plus the raw *.pages.dev URL) — each is matched exactly.
-_origins = [o.strip() for o in settings.bt_app_origin.split(",") if o.strip()]
+# CORS: open to all origins (wildcard) per user request. Safe here because auth
+# is via the signed X-Telegram-Init-Data header, not cookies — no credentials are
+# used, so a wildcard cannot be abused to ride a victim's session. The middleware
+# stays (removing it entirely would omit the Access-Control-Allow-Origin header
+# and browsers would block every cross-origin request). BT_APP_ORIGIN is ignored.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_origins,
+    allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["X-Telegram-Init-Data", "Content-Type"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
