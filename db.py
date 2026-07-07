@@ -15,7 +15,7 @@ Balance is derived (``balance == sum(bt_ledger.amount)``). All balance changes g
 through the ``bt_apply_ledger`` RPC exclusively — never a raw ``UPDATE balance``.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
