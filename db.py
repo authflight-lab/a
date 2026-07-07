@@ -255,6 +255,36 @@ async def upsert_user(tg_id: int, username: str | None = None,
     return result
 
 
+async def ensure_identity(tg_id: int, username: str | None = None,
+                          display_name: str | None = None,
+                          cached_row: dict | None = None) -> dict:
+    """Canonical get-or-create + keep-identity-fresh for a user row.
+
+    The single write path authenticated endpoints funnel through so identity
+    stays consistent across the bot + api. Writes ONLY when the row is missing
+    or a provided non-empty field actually differs from what's stored, so warm
+    reads stay write-free (the /me fast-path invariant). Never clobbers a
+    stored name with NULL (coalesce semantics, matching ``bt_chat_touch``).
+    Returns the current row.
+    """
+    u = cached_row if cached_row is not None else await get_user_cached(tg_id)
+    if u is None:
+        u = await upsert_user(tg_id, username, display_name) or {"tg_id": tg_id}
+        cache_user(tg_id, u)
+        return u
+    changed = (
+        (bool(display_name) and display_name != u.get("display_name"))
+        or (bool(username) and username != u.get("username"))
+    )
+    if changed:
+        u = await upsert_user(
+            tg_id, username or u.get("username"),
+            display_name or u.get("display_name"),
+        ) or u
+        cache_user(tg_id, u)
+    return u
+
+
 async def mark_registered(tg_id: int, username: str | None = None,
                           display_name: str | None = None) -> dict | None:
     """Upsert identity and stamp ``started_at`` the first time the user opens

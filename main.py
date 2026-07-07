@@ -250,15 +250,14 @@ async def me(user: dict = Depends(require_user)):
         await db.mark_registered(tg_id, user.get("username"), user.get("display_name"))
         u = await db.get_user(tg_id) or {}
         db.cache_user(tg_id, u)
-    elif not u.get("display_name"):
-        # Backfill a missing name from the current validated init-data. Rows that
-        # were registered by a path which never stored a display_name would
-        # otherwise render as "Guest" in the app. require_user always supplies a
-        # non-empty display_name (falls back to the tg_id), and this fires at most
-        # once per user, so the warm-cache no-write fast path is preserved.
-        await db.upsert_user(tg_id, user.get("username"), user.get("display_name"))
-        u = await db.get_user(tg_id) or u
-        db.cache_user(tg_id, u)
+    else:
+        # Registered + warm: keep identity canonical via the single
+        # ensure_identity write-path — it backfills a missing name and refreshes
+        # a changed one, but writes only when something actually differs, so the
+        # warm-cache no-write fast path is preserved.
+        u = await db.ensure_identity(
+            tg_id, user.get("username"), user.get("display_name"), cached_row=u
+        )
     day = _today()
     quest = await db.get_quest(tg_id, day) or {"day": day, "chatted": False, "claimed": False}
     chatted = bool(quest.get("chatted", False))
@@ -627,9 +626,9 @@ async def game_seeds(user: dict = Depends(require_user)):
     tg_id = user["tg_id"]
     # Bootstrap the user row first: bt_seed_pairs.tg_id has an FK to bt_users, so
     # a brand-new user hitting this endpoint before /me or a bet would otherwise
-    # fail on the seed-pair insert.
-    if await db.get_user(tg_id) is None:
-        await db.upsert_user(tg_id, user.get("username"), user.get("display_name"))
+    # fail on the seed-pair insert. ensure_identity get-or-creates and keeps the
+    # name fresh through the one canonical write-path.
+    await db.ensure_identity(tg_id, user.get("username"), user.get("display_name"))
     pair = await db.get_seed_pair(tg_id)
     if not pair:
         pair = await db.create_seed_pair(tg_id, seedpair.new_pair())
@@ -649,9 +648,9 @@ async def game_seeds_rotate(user: dict = Depends(require_user), body: dict | Non
     # Ensure a pair exists, then rotate it atomically. The RPC locks the seed-pair
     # row and refuses if ANY round is open (checked under that lock), so revealing
     # the active server_seed can never race a concurrent bet that would still use it.
-    # Bootstrap the user row first (bt_seed_pairs.tg_id FK -> bt_users).
-    if await db.get_user(tg_id) is None:
-        await db.upsert_user(tg_id, user.get("username"), user.get("display_name"))
+    # Bootstrap the user row first (bt_seed_pairs.tg_id FK -> bt_users) via the
+    # one canonical identity write-path.
+    await db.ensure_identity(tg_id, user.get("username"), user.get("display_name"))
     if not await db.get_seed_pair(tg_id):
         await db.create_seed_pair(tg_id, seedpair.new_pair())
     next_seed, next_hash = seedpair.fresh_next()

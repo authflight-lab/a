@@ -37,6 +37,23 @@ def verify_init_data(init_data: str, bot_token: str, max_age: int = 3600) -> dic
     return p  # tg_id comes from p["user"] json only — never from the request body
 
 
+def resolve_display_name(user: dict, tg_id: int | None = None) -> str:
+    """Canonical display-name rule, shared by every API write path.
+
+    first+last name -> @username -> numeric id, always non-empty. This is the
+    single source of truth for a user's name on the API side; it mirrors
+    aiogram's ``full_name`` semantics so the bot and api never write a
+    different name for the same row (the old flicker source).
+    """
+    if tg_id is None:
+        tg_id = user.get("id")
+    return (
+        " ".join(x for x in (user.get("first_name"), user.get("last_name")) if x)
+        or user.get("username")
+        or str(tg_id)
+    )
+
+
 async def require_user(
     x_telegram_init_data: str | None = Header(default=None, alias="X-Telegram-Init-Data"),
 ) -> dict:
@@ -62,9 +79,5 @@ async def require_user(
         "tg_id": tg_id,
         "user": user,
         "username": user.get("username"),
-        "display_name": (
-            " ".join(x for x in (user.get("first_name"), user.get("last_name")) if x)
-            or user.get("username")
-            or str(tg_id)
-        ),
+        "display_name": resolve_display_name(user, tg_id),
     }
