@@ -15,6 +15,7 @@ when unconfigured, endpoints return 503.
 import asyncio
 import logging
 import math
+import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -121,6 +122,17 @@ async def _start_sweeper() -> None:
     asyncio.create_task(_stale_round_sweeper_loop())
 
 logger = logging.getLogger("bt.api")
+# Ensure request-timing (INFO) lines reach stdout in the Render logs regardless
+# of uvicorn's logging config: attach a dedicated handler once and stop
+# propagation so lines are not duplicated by a parent handler.
+if not logger.handlers:
+    _timing_handler = logging.StreamHandler()
+    _timing_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    )
+    logger.addHandler(_timing_handler)
+logger.setLevel(logging.INFO)
+logger.propagate = False
 
 # CORS: open to all origins (wildcard) per user request. Safe here because auth
 # is via the signed X-Telegram-Init-Data header, not cookies — no credentials are
@@ -152,6 +164,35 @@ async def _ip_rate_limit_middleware(request: Request, call_next):
                 headers={"Retry-After": str(retry_after)},
             )
     return await call_next(request)
+
+
+@app.middleware("http")
+async def _timing_middleware(request: Request, call_next):
+    """Measure raw server-side handling time for every request.
+
+    Adds an ``X-Process-Time`` response header (milliseconds) and logs one
+    greppable line per request. This is server think-time only — it excludes
+    all network latency — so it isolates app/platform cost from the wire.
+    Added last so it wraps the rate-limit and CORS middleware, capturing the
+    full in-process time.
+    """
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        dur_ms = (time.perf_counter() - start) * 1000.0
+        logger.info(
+            "req method=%s path=%s status=500 dur_ms=%.1f",
+            request.method, request.url.path, dur_ms,
+        )
+        raise
+    dur_ms = (time.perf_counter() - start) * 1000.0
+    response.headers["X-Process-Time"] = f"{dur_ms:.1f}"
+    logger.info(
+        "req method=%s path=%s status=%s dur_ms=%.1f",
+        request.method, request.url.path, response.status_code, dur_ms,
+    )
+    return response
 
 
 @app.exception_handler(SupabaseNotConfigured)
