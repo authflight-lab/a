@@ -866,19 +866,66 @@ async def chat_counts_since(start_day: str) -> list[dict]:
                        "limit": "100000"})
 
 
-async def ledger_since(start: str, exclude_kind: str | None = None) -> list[dict]:
-    """All ledger rows (any kind) since ``start`` — used for the weekly rich
-    leaderboard's net-points-gained calculation (aggregated in Python).
+async def ledger_totals_since(
+    start: str, exclude_kind: str | None = None
+) -> dict[int, int]:
+    """Net ledger ``amount`` per ``tg_id`` since ``start`` (UTC ISO), as
+    ``{tg_id: net}`` — the weekly rich leaderboard's net-points-gained metric.
 
     ``exclude_kind`` drops one kind (e.g. 'weekly_bonus') so a prior week's
     prize, credited at the Monday boundary, doesn't give past winners a head
-    start in the new week's rich race."""
-    params: dict[str, Any] = {
-        "select": "tg_id,amount", "created_at": f"gte.{start}", "limit": "100000",
-    }
-    if exclude_kind:
-        params["kind"] = f"neq.{exclude_kind}"
-    return await _get("bt_ledger", params)
+    start in the new week's rich race.
+
+    The aggregation runs DB-side via the direct pool (one round-trip, no row
+    cap). This matters: PostgREST enforces a server-side max-rows cap, so a
+    single REST fetch of ``bt_ledger`` silently truncates on a busy week
+    (thousands of ledger rows) and mis-totals the board — summing some rows'
+    bets without their matching wins, which can even net negative. The pool
+    avoids that entirely; the REST fallback paginates so it, too, sees every
+    row."""
+    # pg-first: server-side SUM/GROUP BY, immune to the REST max-rows cap.
+    # asyncpg binds a timestamptz param from a datetime, so parse the ISO string.
+    start_dt = datetime.fromisoformat(start)
+    try:
+        pool = await pgpool.get_pool()
+        if exclude_kind:
+            recs = await pool.fetch(
+                "select tg_id, sum(amount)::bigint total from bt_ledger "
+                "where created_at >= $1 and kind <> $2 group by tg_id",
+                start_dt, exclude_kind)
+        else:
+            recs = await pool.fetch(
+                "select tg_id, sum(amount)::bigint total from bt_ledger "
+                "where created_at >= $1 group by tg_id",
+                start_dt)
+        return {int(r["tg_id"]): int(r["total"]) for r in recs}
+    except Exception as e:  # noqa: BLE001 — pool unavailable → REST
+        if not pgpool.should_fallback(e):
+            raise
+
+    # REST fallback: page through every row so the max-rows cap can never
+    # truncate the sum. Cap-agnostic — we advance by the number of rows the
+    # server actually returned (which the cap may shrink below ``page``) and
+    # stop only on an empty page, so a cap smaller than ``page`` can't end the
+    # loop early. ``order=id.asc`` keeps paging stable (no row skipped or
+    # double-counted across pages).
+    totals: dict[int, int] = {}
+    page, offset = 1000, 0
+    while True:
+        params: dict[str, Any] = {
+            "select": "tg_id,amount", "created_at": f"gte.{start}",
+            "order": "id.asc", "limit": str(page), "offset": str(offset),
+        }
+        if exclude_kind:
+            params["kind"] = f"neq.{exclude_kind}"
+        rows = await _get("bt_ledger", params)
+        if not rows:
+            break
+        for r in rows:
+            uid = int(r["tg_id"])
+            totals[uid] = totals.get(uid, 0) + int(r["amount"])
+        offset += len(rows)
+    return totals
 
 
 async def get_config(key: str) -> str | None:

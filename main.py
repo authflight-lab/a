@@ -659,11 +659,10 @@ async def leaderboard(
             return {"tab": tab, "period": period, "rows": rows, "you": you}
 
         # Weekly rich = net points gained this week (sum of all ledger amounts),
-        # excluding the weekly bonus itself so past winners don't get a head start.
-        ledger = await db.ledger_since(_week_start(), exclude_kind="weekly_bonus")
-        totals: dict[int, int] = defaultdict(int)
-        for row in ledger:
-            totals[int(row["tg_id"])] += int(row["amount"])
+        # excluding the weekly bonus itself so past winners don't get a head
+        # start. Aggregated DB-side so the sum can't be truncated by PostgREST's
+        # max-rows cap on a busy week (thousands of ledger rows).
+        totals = await db.ledger_totals_since(_week_start(), exclude_kind="weekly_bonus")
         # Rich is registered-only: drop unregistered chatters (they keep their
         # points and their Chatters spot, but never rank on Rich).
         reg = await db.registered_ids(list(totals.keys()))
