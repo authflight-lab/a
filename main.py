@@ -778,6 +778,23 @@ async def game_bet(name: str, user: dict = Depends(require_user), body: dict | N
     if result is None:
         return _err("try_again", 409)
 
+    # Warm the open-round cache so the first step skips a get_round read. These
+    # fields are exactly what get_round would return for this round; bt_open_round
+    # has just persisted the identical row.
+    _round_cache_put({
+        "id": result.get("round_id"),
+        "tg_id": tg_id,
+        "game": name,
+        "bet": bet,
+        "server_seed": ss,
+        "server_hash": result.get("server_hash"),
+        "client_seed": cs,
+        "nonce": result.get("nonce", nonce),
+        "params": np,
+        "outcome": state,
+        "status": "open",
+    })
+
     resp_params = dict(np)
     if name == "highlow":
         resp_params["start_card"] = state["start_card"]
@@ -790,45 +807,94 @@ async def game_bet(name: str, user: dict = Depends(require_user), body: dict | N
     }
 
 
+# In-process cache of OPEN rounds, keyed by round_id. It lets a mid-game step
+# skip the get_round read: a round's identity fields (seed, nonce, bet, params)
+# are immutable for its whole life, and the mutable `outcome` state is written
+# through on every step. The DB stays authoritative — every step still writes,
+# settlement is still a guarded RPC, and on a cache miss (cold start, a second
+# worker/process, or after settle) we fall back to a fresh get_round. Entries
+# are dropped on settle. Bounded so a burst of rounds cannot grow it unbounded.
+_ROUND_CACHE: dict[str, dict] = {}
+_ROUND_CACHE_MAX = 2000
+
+
+def _round_cache_put(rnd: dict) -> None:
+    rid = rnd.get("id")
+    if not rid:
+        return
+    if rid not in _ROUND_CACHE and len(_ROUND_CACHE) >= _ROUND_CACHE_MAX:
+        # Crude bound: drop everything and let it refill lazily from the DB.
+        # Safe because state is written through, so a miss just costs one read.
+        _ROUND_CACHE.clear()
+    _ROUND_CACHE[rid] = rnd
+
+
+def _round_cache_pop(round_id) -> None:
+    if round_id:
+        _ROUND_CACHE.pop(round_id, None)
+
+
 async def _load_open_round(name: str, tg_id: int, round_id):
     if not round_id:
         return None, _err("invalid_request")
-    rnd = await db.get_round(round_id)
+    # Serve the round from the in-process cache when we already hold it, so a
+    # mid-game step does a single write instead of read-then-write. Fall back to
+    # a fresh read (the DB is authoritative) on any miss.
+    rnd = _ROUND_CACHE.get(round_id)
+    from_cache = rnd is not None
+    if rnd is None:
+        rnd = await db.get_round(round_id)
     if not rnd or int(rnd["tg_id"]) != tg_id or rnd["game"] != name:
         return None, _err("round_not_found", 404)
     if rnd["status"] != "open":
         return None, _err("round_not_open")
+    if not from_cache:
+        _round_cache_put(rnd)
     return rnd, None
 
 
-async def _finalise(rnd: dict, tg_id: int, multiplier: float, status: str, outcome: dict):
-    """Close the round FIRST (guarded on status='open'), then credit any win.
+async def _persist_step(rnd: dict, new_state: dict) -> bool:
+    """Write a mid-game step's new state in a single guarded round trip.
 
-    Ordering matters: closing before crediting makes settlement idempotent, so
-    two concurrent settle/cashout calls for the same round cannot both pay out
-    (spec §14 'double-settle rejected'). If another request already closed it we
-    return an error envelope and do NOT credit. A crash between close and credit
-    forfeits the payout rather than paying it twice.
+    Uses a status='open' guarded PATCH so a stale cache entry (e.g. the round was
+    settled by a concurrent cashout or swept as timed-out) can never revive a
+    closed round: on a miss we drop the cache entry and the caller surfaces
+    ``round_not_open``. On success we write the new state through to the cache so
+    the next step can skip its read. Returns True if the round was still open.
+    """
+    updated = await db.update_open_round(rnd["id"], {"outcome": new_state})
+    if updated is None:
+        _round_cache_pop(rnd["id"])
+        return False
+    rnd["outcome"] = new_state
+    _round_cache_put(rnd)
+    return True
+
+
+async def _finalise(rnd: dict, tg_id: int, multiplier: float, status: str, outcome: dict):
+    """Atomically close the round (guarded on status='open') AND credit any win.
+
+    Delegates to the ``bt_settle_round`` RPC so the close and the payout credit
+    commit in ONE transaction and ONE round trip. This keeps settlement
+    idempotent — a concurrent double-settle/cashout finds the round already
+    closed, credits nothing, and returns an error envelope (spec §14
+    'double-settle rejected') — and, unlike the previous close-then-credit pair,
+    a crash can no longer land between the close and the credit (the payout is
+    either committed with the close or not at all).
     """
     bet = int(rnd["bet"])
     payout = _payout(bet, multiplier) if multiplier > 0 else 0
-    closed = await db.close_round(rnd["id"], {
-        "outcome": outcome, "payout": payout, "status": status, "settled_at": db._now(),
-    })
-    if closed is None:
+    res = await db.settle_round(rnd["id"], tg_id, outcome, payout, status)
+    _round_cache_pop(rnd["id"])
+    if not res.get("closed"):
         return {"ok": False, "error": "round_not_open"}
-    if payout > 0:
-        new_balance = await db.apply_ledger(tg_id, payout, "game_win", ref=rnd["game"], meta={"round": rnd["id"]})
-    else:
-        u = await db.get_user(tg_id)
-        new_balance = int((u or {}).get("balance", 0))
     # NB: the active server_seed is intentionally NOT returned here — it stays
     # secret across the pair's reuse and is revealed only on rotation. Rendering
     # relies on the outcome fields (e.g. mines includes the full `mines` layout).
     return {
         "outcome": outcome,
         "payout": payout,
-        "new_balance": new_balance,
+        "new_balance": int(res.get("new_balance", 0)),
         "server_hash": rnd["server_hash"],
     }
 
@@ -889,7 +955,8 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
         new_streak = streak + 1
         mult = flip.multiplier(new_streak)
         new_state = {"streak": new_streak, "multiplier": mult, "coin": coin, "guess": guess}
-        await db.update_round(rnd["id"], {"outcome": new_state})
+        if not await _persist_step(rnd, new_state):
+            return _err("round_not_open")
         return {"outcome_step": {"coin": coin, "guess": guess, "streak": new_streak},
                 "multiplier": mult, "can_cashout": True, "busted": False, "done": False}
 
@@ -927,7 +994,8 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
             final = await _finalise(rnd, tg_id, mult, "cashed_out", outcome)
             return {"outcome_step": {"cell": cell, "safe": True}, "multiplier": mult,
                     "can_cashout": True, "busted": False, "done": True, **final}
-        await db.update_round(rnd["id"], {"outcome": new_state})
+        if not await _persist_step(rnd, new_state):
+            return _err("round_not_open")
         return {"outcome_step": {"cell": cell, "safe": True}, "multiplier": mult,
                 "can_cashout": True, "busted": False, "done": False}
 
@@ -965,7 +1033,8 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
             final = await _finalise(rnd, tg_id, mult, "cashed_out", outcome)
             return {"outcome_step": {"floor": floor, "col": col, "safe": True}, "multiplier": mult,
                     "can_cashout": True, "busted": False, "done": True, **final}
-        await db.update_round(rnd["id"], {"outcome": new_state})
+        if not await _persist_step(rnd, new_state):
+            return _err("round_not_open")
         return {"outcome_step": {"floor": floor, "col": col, "safe": True}, "multiplier": mult,
                 "can_cashout": True, "busted": False, "done": False}
 
@@ -990,7 +1059,8 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
         new_skips = skips + 1
         new_state = {"rank": new_rank, "step": step_n + 1, "multiplier": cur_mult,
                      "skips": new_skips, "picks": picks}
-        await db.update_round(rnd["id"], {"outcome": new_state})
+        if not await _persist_step(rnd, new_state):
+            return _err("round_not_open")
         return {"outcome_step": {"current": new_rank, "prev": r, "guess": "skip",
                                  "skipped": True, "win": True, "skips": new_skips},
                 "multiplier": cur_mult, "can_cashout": picks >= 1, "skips": new_skips,
@@ -1012,7 +1082,8 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
     # A real pick resets the skip allowance and counts toward the cashout minimum.
     new_state = {"rank": new_rank, "step": step_n + 1, "multiplier": new_mult,
                  "skips": 0, "picks": picks + 1}
-    await db.update_round(rnd["id"], {"outcome": new_state})
+    if not await _persist_step(rnd, new_state):
+        return _err("round_not_open")
     return {"outcome_step": {"drawn": drawn, "current": new_rank, "prev": r, "guess": guess, "win": True},
             "multiplier": new_mult, "can_cashout": True, "skips": 0, "busted": False, "done": False}
 

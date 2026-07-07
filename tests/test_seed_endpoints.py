@@ -122,13 +122,40 @@ class FakeDB:
         r.update(patch)
         return r
 
+    async def update_open_round(self, rid, patch):
+        r = self.rounds.get(rid)
+        if not r or r["status"] != "open":
+            return None
+        r.update(patch)
+        return r
+
+    async def settle_round(self, rid, tg_id, outcome, payout, status):
+        # Mirror bt_settle_round: guarded close on status='open' + credit in one
+        # step. A concurrent double-settle finds it already closed (closed=False)
+        # and credits nothing.
+        r = self.rounds.get(rid)
+        if not r or r["tg_id"] != tg_id or r["status"] != "open":
+            u = self.users.get(tg_id) or {}
+            return {"closed": False, "new_balance": int(u.get("balance", 0))}
+        r.update({"outcome": outcome, "payout": payout, "status": status})
+        u = self.users[tg_id]
+        if payout > 0:
+            u["balance"] += payout
+        return {"closed": True, "new_balance": u["balance"]}
+
 
 @pytest.fixture()
 def client(monkeypatch):
+    # The open-round cache is module-level in api.main, so clear it between tests
+    # (each FakeDB restarts round ids at "1", which would otherwise collide with a
+    # previous test's cached round).
+    from api import main as _main
+    _main._ROUND_CACHE.clear()
     fake = FakeDB()
     for name in ("get_user", "upsert_user", "apply_ledger", "get_seed_pair",
                  "create_seed_pair", "open_round", "rotate_seed_pair",
-                 "get_open_round", "get_round", "update_round", "close_round"):
+                 "get_open_round", "get_round", "update_round", "update_open_round",
+                 "close_round", "settle_round"):
         monkeypatch.setattr(db, name, getattr(fake, name))
     app.dependency_overrides[require_user] = lambda: {
         "tg_id": 1, "user": {"id": 1}, "username": "u", "display_name": "U",

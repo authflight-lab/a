@@ -545,6 +545,47 @@ async def close_round(round_id: str, patch: dict) -> dict | None:
                         {"id": f"eq.{round_id}", "status": "eq.open"}, patch)
 
 
+async def update_open_round(round_id: str, patch: dict) -> dict | None:
+    """PATCH a round's mutable state guarded on ``status='open'``.
+
+    Returns the updated row, or ``None`` if the round is no longer open (settled
+    by a concurrent cashout/bust, or swept as timed-out). Lets a caller working
+    from an in-process cache detect a stale entry and fall back correctly instead
+    of reviving a closed round.
+    """
+    return await _patch("bt_game_rounds",
+                        {"id": f"eq.{round_id}", "status": "eq.open"}, patch)
+
+
+async def settle_round(round_id: str, tg_id: int, outcome: dict, payout: int,
+                       status: str) -> dict:
+    """Call ``bt_settle_round`` — atomically close an open round and credit any
+    payout in a single transaction (one round trip). Returns
+    ``{"closed": bool, "new_balance": int}``.
+
+    Guarded on ``status='open'`` server-side, so a concurrent double-settle
+    returns ``closed=False`` and credits nothing (idempotent).
+    """
+    client = _get_client()
+    payload = {
+        "p_round_id": round_id,
+        "p_tg_id": tg_id,
+        "p_outcome": outcome,
+        "p_payout": payout,
+        "p_status": status,
+    }
+    r = await client.post("/rpc/bt_settle_round", json=payload)
+    if r.status_code >= 400:
+        body = ""
+        try:
+            body = r.text
+        except Exception:
+            pass
+        raise SupabaseError(f"settle_round failed: {r.status_code} {body}")
+    _invalidate_user(tg_id)
+    return r.json()
+
+
 async def claim_daily(tg_id: int, day_start_iso: str, streak: int, now_iso: str) -> dict | None:
     """Compare-and-swap the daily claim: set ``streak_days``/``last_claim_at``
     only if ``last_claim_at`` predates today's UTC start (or is null).
