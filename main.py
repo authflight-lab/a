@@ -775,23 +775,30 @@ async def game_seeds_rotate(user: dict = Depends(require_user), body: dict | Non
     return {"ok": True, **rotated}
 
 
-@app.post("/bt/api/game/{name}/bet")
-async def game_bet(name: str, user: dict = Depends(require_user), body: dict | None = Body(default=None)):
+async def _open_bet(name: str, user: dict, body: dict | None):
+    """Open a round and reserve its nonce atomically. Returns (rnd, resp, err).
+
+    Shared by /bet (which returns ``resp`` to the client and stops) and /play
+    (which uses ``rnd`` to settle a single-settle game in the SAME request).
+    ``rnd`` is the full open-round dict — identical to what the open-round cache
+    and ``get_round`` hold — so a follow-on settle needs no extra DB read. On any
+    handled failure ``err`` is the response to return and ``rnd``/``resp`` are None.
+    """
     if name not in GAMES:
-        return _err("unknown_game", 404)
+        return None, None, _err("unknown_game", 404)
     tg_id = user["tg_id"]
     allowed, retry_after = ratelimit.check(f"game:{tg_id}", limit=60, window_sec=60)
     if not allowed:
-        return _rl_err(retry_after)
+        return None, None, _rl_err(retry_after)
 
     body = body or {}
     try:
         bet = int(body.get("bet", 0))
     except (TypeError, ValueError):
-        return _err("invalid_bet")
+        return None, None, _err("invalid_bet")
     ok, np = _validate_params(name, body.get("params") or {})
     if not ok:
-        return _err("invalid_params")
+        return None, None, _err("invalid_params")
 
     u = await db.get_user(tg_id)
     if u is None:
@@ -801,13 +808,13 @@ async def game_bet(name: str, user: dict = Depends(require_user), body: dict | N
     # cap) from simply not having enough points, so the client can show a
     # "balance too low" message instead of a generic invalid-bet error.
     if bet < BET_MIN or bet > BET_MAX:
-        return {"ok": False, "error": "invalid_bet"}
+        return None, None, {"ok": False, "error": "invalid_bet"}
     if bet > balance:
-        return {"ok": False, "error": "insufficient_balance"}
+        return None, None, {"ok": False, "error": "insufficient_balance"}
 
     # One open round per (user, game) (unique index bt_one_open_round is the backstop).
     if await db.get_open_round(tg_id, name):
-        return {"ok": False, "error": "open_round_exists"}
+        return None, None, {"ok": False, "error": "open_round_exists"}
 
     # Reuse the user's active seed pair (Rainbet-style): the server & client
     # seeds persist across bets and only the per-pair nonce advances. The active
@@ -824,6 +831,8 @@ async def game_bet(name: str, user: dict = Depends(require_user), body: dict | N
     # retry with the fresh nonce.
     state: dict = {}
     result: dict | None = None
+    ss = cs = ""
+    nonce = 0
     for _ in range(4):
         ss = pair["server_seed"]
         cs = pair["client_seed"]
@@ -833,21 +842,20 @@ async def game_bet(name: str, user: dict = Depends(require_user), body: dict | N
             result = await db.open_round(tg_id, name, bet, nonce, np, state)
             break
         except InsufficientBalance:
-            return {"ok": False, "error": "insufficient_balance"}
+            return None, None, {"ok": False, "error": "insufficient_balance"}
         except db.OpenRoundExists:
-            return {"ok": False, "error": "open_round_exists"}
+            return None, None, {"ok": False, "error": "open_round_exists"}
         except db.NonceConflict:
             refreshed = await db.get_seed_pair(tg_id)
             if not refreshed:
                 break
             pair = refreshed
     if result is None:
-        return _err("try_again", 409)
+        return None, None, _err("try_again", 409)
 
-    # Warm the open-round cache so the first step skips a get_round read. These
-    # fields are exactly what get_round would return for this round; bt_open_round
-    # has just persisted the identical row.
-    _round_cache_put({
+    # The full open-round row. These fields are exactly what get_round would
+    # return for this round; bt_open_round has just persisted the identical row.
+    rnd = {
         "id": result.get("round_id"),
         "tg_id": tg_id,
         "game": name,
@@ -859,18 +867,28 @@ async def game_bet(name: str, user: dict = Depends(require_user), body: dict | N
         "params": np,
         "outcome": state,
         "status": "open",
-    })
+    }
+    # Warm the open-round cache so the first step (or the /play settle below)
+    # skips a get_round read.
+    _round_cache_put(rnd)
 
     resp_params = dict(np)
     if name == "highlow":
         resp_params["start_card"] = state["start_card"]
-    return {
+    resp = {
         "round_id": result.get("round_id"),
         "server_hash": result.get("server_hash"),
         "nonce": result.get("nonce"),
         "balance": result.get("balance"),
         "params": resp_params,
     }
+    return rnd, resp, None
+
+
+@app.post("/bt/api/game/{name}/bet")
+async def game_bet(name: str, user: dict = Depends(require_user), body: dict | None = Body(default=None)):
+    _rnd, resp, err = await _open_bet(name, user, body)
+    return err or resp
 
 
 # In-process cache of OPEN rounds, keyed by round_id. It lets a mid-game step
@@ -987,6 +1005,43 @@ async def game_settle(name: str, user: dict = Depends(require_user), body: dict 
         result = plinko.drop(ss, cs, nonce, int(params["rows"]), str(params["risk"]))
         multiplier = result["multiplier"]
     return await _finalise(rnd, tg_id, multiplier, "settled", result)
+
+
+@app.post("/bt/api/game/{name}/play")
+async def game_play(name: str, user: dict = Depends(require_user), body: dict | None = Body(default=None)):
+    """One-shot open+settle for single-settle games (dice, plinko).
+
+    A single-settle game's outcome is fully determined the moment the round opens
+    — there is no mid-round interaction — so opening and settling in ONE request
+    saves a whole client<->server round trip versus /bet then /settle. Provably
+    fair is unchanged: the active server seed stays secret (only its hash is
+    returned), the nonce advances via the same atomic open_round RPC, and
+    settlement is the same guarded, idempotent settle_round RPC. /bet + /settle
+    remain for multi-step games and as a fallback for clients that predate /play.
+    """
+    if name not in SINGLE_SETTLE:
+        return _err("invalid_action")
+    tg_id = user["tg_id"]
+    rnd, resp, err = await _open_bet(name, user, body)
+    if err:
+        return err
+
+    ss, cs, nonce = rnd["server_seed"], rnd["client_seed"], int(rnd["nonce"])
+    params = rnd.get("params") or {}
+    if name == "dice":
+        result = dice.settle(ss, cs, nonce, int(params["target"]))
+    else:  # plinko
+        result = plinko.drop(ss, cs, nonce, int(params["rows"]), str(params["risk"]))
+    settled = await _finalise(rnd, tg_id, result["multiplier"], "settled", result)
+    if settled.get("ok") is False:
+        return settled
+    # Fold the bet-side identity fields into the settle payload so the client gets
+    # everything (hash + nonce for the Provably Fair panel, params, outcome,
+    # payout, new_balance) from the single call.
+    settled["round_id"] = resp["round_id"]
+    settled["nonce"] = resp["nonce"]
+    settled["params"] = resp["params"]
+    return settled
 
 
 @app.post("/bt/api/game/{name}/step")

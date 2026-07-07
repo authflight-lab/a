@@ -216,6 +216,50 @@ def test_bet_and_settle_never_leak_active_server_seed(client):
     assert s["server_hash"] == b["server_hash"]  # only the commitment, never the seed
 
 
+def test_play_one_shot_opens_and_settles_in_a_single_call(client):
+    # /play opens AND settles a single-settle game in one request, returning the
+    # settle outcome plus the bet-side hash/nonce — and never the active seed.
+    r = client.post("/bt/api/game/dice/play",
+                    json={"bet": 10, "params": {"target": 50}})
+    assert r.status_code == 200
+    j = r.json()
+    assert j.get("ok") is not False
+    assert "server_seed" not in j                       # active seed never leaks
+    assert j["server_hash"] and j["nonce"] == 0 and j["round_id"]
+    assert "roll" in j["outcome"] and isinstance(j["outcome"]["win"], bool)
+    assert "new_balance" in j
+    # The round is closed by the same call: a follow-up settle is rejected.
+    again = client.post("/bt/api/game/dice/settle", json={"round_id": j["round_id"]})
+    assert again.status_code == 400
+    # And the nonce advanced for the next round, exactly like /bet + /settle.
+    nxt = client.post("/bt/api/game/dice/play",
+                      json={"bet": 10, "params": {"target": 50}})
+    assert nxt.json()["nonce"] == 1
+
+
+def test_play_plinko_one_shot_settles_and_holds_invariants(client):
+    # Plinko is the other single-settle game: /play must open+settle it in one
+    # call with the same guarantees as dice (no active seed leak, nonce advances,
+    # round closed by the same request).
+    r = client.post("/bt/api/game/plinko/play",
+                    json={"bet": 10, "params": {"rows": 8, "risk": "low"}})
+    assert r.status_code == 200
+    j = r.json()
+    assert "server_seed" not in j
+    assert j["server_hash"] and j["nonce"] == 0 and j["round_id"]
+    assert "bucket" in j["outcome"] and "new_balance" in j
+    again = client.post("/bt/api/game/plinko/settle", json={"round_id": j["round_id"]})
+    assert again.status_code == 400
+
+
+def test_play_rejects_multi_step_games(client):
+    # /play is single-settle only; a multi-step game must use /bet + /step.
+    r = client.post("/bt/api/game/mines/play",
+                    json={"bet": 10, "params": {"mines": 3}})
+    assert r.status_code == 400
+    assert r.json()["error"] == "invalid_action"
+
+
 def test_step_and_cashout_never_leak_active_server_seed(client):
     bet = client.post("/bt/api/game/mines/bet",
                       json={"bet": 10, "params": {"mines": 3}})
