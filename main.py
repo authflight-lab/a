@@ -250,6 +250,15 @@ async def me(user: dict = Depends(require_user)):
         await db.mark_registered(tg_id, user.get("username"), user.get("display_name"))
         u = await db.get_user(tg_id) or {}
         db.cache_user(tg_id, u)
+    elif not u.get("display_name"):
+        # Backfill a missing name from the current validated init-data. Rows that
+        # were registered by a path which never stored a display_name would
+        # otherwise render as "Guest" in the app. require_user always supplies a
+        # non-empty display_name (falls back to the tg_id), and this fires at most
+        # once per user, so the warm-cache no-write fast path is preserved.
+        await db.upsert_user(tg_id, user.get("username"), user.get("display_name"))
+        u = await db.get_user(tg_id) or u
+        db.cache_user(tg_id, u)
     day = _today()
     quest = await db.get_quest(tg_id, day) or {"day": day, "chatted": False, "claimed": False}
     chatted = bool(quest.get("chatted", False))
