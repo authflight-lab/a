@@ -677,3 +677,20 @@ async def display_names(tg_ids: list[int]) -> dict[int, str]:
     ids = ",".join(str(i) for i in tg_ids)
     rows = await _get("bt_users", {"select": "tg_id,display_name", "tg_id": f"in.({ids})"})
     return {int(r["tg_id"]): (r.get("display_name") or str(r["tg_id"])) for r in rows}
+
+
+async def registered_ids(tg_ids: list[int]) -> set[int]:
+    """Subset of ``tg_ids`` whose users are registered (``started_at`` set).
+
+    The Rich leaderboard is registered-only: unregistered chatters keep their
+    points and their spot on Chatters, but never appear on Rich. Batched to stay
+    well under PostgREST URL-length limits on large weeks."""
+    uniq = list({int(i) for i in tg_ids})
+    out: set[int] = set()
+    for i in range(0, len(uniq), 150):
+        chunk = ",".join(str(x) for x in uniq[i:i + 150])
+        rows = await _get("bt_users",
+                          {"select": "tg_id", "tg_id": f"in.({chunk})",
+                           "started_at": "not.is.null"})
+        out.update(int(r["tg_id"]) for r in rows)
+    return out

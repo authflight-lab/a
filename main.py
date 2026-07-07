@@ -540,7 +540,8 @@ async def leaderboard(
             ]
             u = await db.get_user_cached(tg_id)
             you = None
-            if u is not None:
+            # Rich is registered-only; an unregistered caller has no Rich rank.
+            if u is not None and u.get("started_at"):
                 bal = int(u.get("balance", 0))
                 you = {"rank": await db.rich_rank(tg_id, bal), "value": bal}
             return {"tab": tab, "period": period, "rows": rows, "you": you}
@@ -551,6 +552,10 @@ async def leaderboard(
         totals: dict[int, int] = defaultdict(int)
         for row in ledger:
             totals[int(row["tg_id"])] += int(row["amount"])
+        # Rich is registered-only: drop unregistered chatters (they keep their
+        # points and their Chatters spot, but never rank on Rich).
+        reg = await db.registered_ids(list(totals.keys()))
+        totals = {uid: v for uid, v in totals.items() if uid in reg}
         rows, you = await _rows_from_totals(totals, tg_id)
         return {"tab": tab, "period": period, "rows": rows, "you": you}
 
