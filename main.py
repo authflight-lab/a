@@ -254,6 +254,16 @@ STOCK_PERIOD = "ALL"
 _EPOCH = "1970-01-01T00:00:00+00:00"
 
 
+def _week_reset_at() -> str:
+    """ISO timestamp of the NEXT UTC week boundary (next Monday 00:00:00 UTC) —
+    when the weekly leaderboard resets. The client uses this to render a
+    static "resets in Xd Xh Xm" on load/tab-switch; it never polls."""
+    now = datetime.now(timezone.utc)
+    monday = now - timedelta(days=now.weekday())
+    this_monday = monday.replace(hour=0, minute=0, second=0, microsecond=0)
+    return (this_monday + timedelta(days=7)).isoformat()
+
+
 def _week_start() -> str:
     """Start of the current UTC week (Monday 00:00:00 UTC), ISO-formatted."""
     now = datetime.now(timezone.utc)
@@ -701,7 +711,8 @@ async def leaderboard(
             totals = {uid: v for uid, v in totals.items() if uid in reg}
             cache.put(cache_key, totals, db._LB_CACHE_TTL)
         rows, you = await _rows_from_totals(totals, tg_id)
-        return {"tab": tab, "period": period, "rows": rows, "you": you}
+        return {"tab": tab, "period": period, "rows": rows, "you": you,
+                "resets_at": _week_reset_at()}
 
     # chatters: raw messages sent (ranked by message count, not points earned).
     start_day = _week_start()[:10] if period == "weekly" else _EPOCH[:10]
@@ -710,7 +721,10 @@ async def leaderboard(
     for row in counts:
         totals[int(row["tg_id"])] += int(row["count"])
     rows, you = await _rows_from_totals(totals, tg_id)
-    return {"tab": tab, "period": period, "rows": rows, "you": you}
+    resp = {"tab": tab, "period": period, "rows": rows, "you": you}
+    if period == "weekly":
+        resp["resets_at"] = _week_reset_at()
+    return resp
 
 
 @app.get("/bt/api/history")
