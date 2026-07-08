@@ -23,7 +23,7 @@ from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from . import db, notify, pgpool, ratelimit
+from . import cache, db, notify, pgpool, ratelimit
 from .auth import require_user
 from .config import settings
 from .db import InsufficientBalance, SupabaseNotConfigured
@@ -524,13 +524,17 @@ async def rewards(_user: dict = Depends(require_user)):
         return _rl_err(retry_after)
     period = STOCK_PERIOD
     items = await db.list_rewards(active_only=True)
+    # One batched usage read for every limited reward (was one round-trip per
+    # reward — the catalogue N+1). Rewards absent from the map have 0 usage.
+    limited_ids = [r["id"] for r in items if int(r.get("monthly_limit", 0)) != 0]
+    usages = await db.get_reward_usages(limited_ids, period)
     out = []
     for r in items:
         limit = int(r.get("monthly_limit", 0))
         if limit == 0:
             remaining = None  # unlimited
         else:
-            used = await db.get_reward_usage(r["id"], period)
+            used = usages.get(str(r["id"]), 0)
             remaining = max(0, limit - used)
         out.append({
             "id": r["id"],
@@ -683,12 +687,19 @@ async def leaderboard(
         # Weekly rich = net points gained this week (sum of all ledger amounts),
         # excluding the weekly bonus itself so past winners don't get a head
         # start. Aggregated DB-side so the sum can't be truncated by PostgREST's
-        # max-rows cap on a busy week (thousands of ledger rows).
-        totals = await db.ledger_totals_since(_week_start(), exclude_kind="weekly_bonus")
-        # Rich is registered-only: drop unregistered chatters (they keep their
-        # points and their Chatters spot, but never rank on Rich).
-        reg = await db.registered_ids(list(totals.keys()))
-        totals = {uid: v for uid, v in totals.items() if uid in reg}
+        # max-rows cap on a busy week (thousands of ledger rows). The finished
+        # registered-only totals map is shared by every caller, so cache it
+        # briefly — the per-caller "you" row is still computed fresh from it.
+        week_start = _week_start()
+        cache_key = f"lb:rich:weekly:{week_start}"
+        totals = cache.get(cache_key)
+        if totals is None:
+            totals = await db.ledger_totals_since(week_start, exclude_kind="weekly_bonus")
+            # Rich is registered-only: drop unregistered chatters (they keep
+            # their points and their Chatters spot, but never rank on Rich).
+            reg = await db.registered_ids(list(totals.keys()))
+            totals = {uid: v for uid, v in totals.items() if uid in reg}
+            cache.put(cache_key, totals, db._LB_CACHE_TTL)
         rows, you = await _rows_from_totals(totals, tg_id)
         return {"tab": tab, "period": period, "rows": rows, "you": you}
 

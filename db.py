@@ -234,6 +234,13 @@ async def redeem(tg_id: int, reward_id: str, period: str) -> dict:
 # changes rarely so it can live longer.
 _USER_CACHE_TTL = 5.0
 _REWARDS_CACHE_TTL = 60.0
+# Home-card stats + rich rank: display-only, so a few seconds of staleness is
+# invisible while collapsing the per-/me recomputation (a COUNT over bt_users
+# plus the bt_user_stats RPC) into one read per user per TTL window.
+_STATS_CACHE_TTL = 10.0
+# Leaderboard reads (Rich/Chatters): read-heavy, whole-board data shared by
+# every caller; nobody needs it real-time to the second.
+_LB_CACHE_TTL = 15.0
 
 
 def _user_key(tg_id: int) -> str:
@@ -242,6 +249,9 @@ def _user_key(tg_id: int) -> str:
 
 def _invalidate_user(tg_id: int) -> None:
     cache.invalidate(_user_key(tg_id))
+    # Stats ride along with the profile: any balance/activity mutation should
+    # also drop the cached home-card stats so /me reflects it promptly.
+    cache.invalidate(f"stats:{tg_id}")
 
 
 async def _get_user_rest(tg_id: int) -> dict | None:
@@ -406,10 +416,54 @@ async def get_reward(reward_id: str) -> dict | None:
     return rows[0] if rows else None
 
 
-async def get_reward_usage(reward_id: str, period: str) -> int:
+async def _get_reward_usage_rest(reward_id: str, period: str) -> int:
     rows = await _get("bt_reward_usage",
                       {"reward_id": f"eq.{reward_id}", "period": f"eq.{period}", "select": "used", "limit": "1"})
     return int(rows[0]["used"]) if rows else 0
+
+
+async def get_reward_usage(reward_id: str, period: str) -> int:
+    """Usage counter for one reward in ``period`` (direct-DB, REST fallback)."""
+    try:
+        pool = await pgpool.get_pool()
+        val = await pool.fetchval(
+            "select used from bt_reward_usage where reward_id = $1::uuid and period = $2 limit 1",
+            str(reward_id), period)
+        return int(val) if val is not None else 0
+    except Exception as e:  # noqa: BLE001
+        if pgpool.should_fallback(e):
+            return await _get_reward_usage_rest(reward_id, period)
+        raise
+
+
+async def _get_reward_usages_rest(reward_ids: list[str], period: str) -> dict[str, int]:
+    ids = ",".join(str(i) for i in reward_ids)
+    rows = await _get("bt_reward_usage",
+                      {"reward_id": f"in.({ids})", "period": f"eq.{period}",
+                       "select": "reward_id,used"})
+    return {str(r["reward_id"]): int(r["used"]) for r in rows}
+
+
+async def get_reward_usages(reward_ids: list[str], period: str) -> dict[str, int]:
+    """Usage counters for many rewards in one round-trip: ``{reward_id: used}``.
+
+    Rewards with no usage row are simply absent (callers default to 0). This is
+    the /rewards catalogue path — one query for the whole page instead of one
+    round-trip per limited reward (the old N+1). Direct-DB, REST fallback.
+    """
+    if not reward_ids:
+        return {}
+    try:
+        pool = await pgpool.get_pool()
+        recs = await pool.fetch(
+            "select reward_id, used from bt_reward_usage "
+            "where period = $1 and reward_id = any($2::uuid[])",
+            period, [str(i) for i in reward_ids])
+        return {str(r["reward_id"]): int(r["used"]) for r in recs}
+    except Exception as e:  # noqa: BLE001
+        if pgpool.should_fallback(e):
+            return await _get_reward_usages_rest(reward_ids, period)
+        raise
 
 
 async def incr_reward_usage(reward_id: str, period: str) -> None:
@@ -815,15 +869,37 @@ async def rounds_history(tg_id: int, limit: int = 50) -> list[dict]:
                        "order": "created_at.desc", "limit": str(limit)})
 
 
-async def leaderboard_rich(limit: int = 20) -> list[dict]:
+async def _leaderboard_rich_rest(limit: int = 20) -> list[dict]:
     return await _get("bt_users",
                       {"select": "tg_id,display_name,balance",
                        "order": "balance.desc", "limit": str(limit),
                        "started_at": "not.is.null"})
 
 
-async def rich_rank(tg_id: int, balance: int) -> int:
-    """1-based rank on the rich list = count(registered users with balance > mine) + 1."""
+async def leaderboard_rich(limit: int = 20) -> list[dict]:
+    """Top registered balances (direct-DB, REST fallback), cached briefly:
+    the whole board is shared by every caller and the bt_users_balance_idx
+    read is pointless to repeat 20x/minute per user."""
+    key = f"lb:rich:alltime:{limit}"
+    hit = cache.get(key)
+    if hit is not None:
+        return hit
+    try:
+        pool = await pgpool.get_pool()
+        recs = await pool.fetch(
+            "select tg_id, display_name, balance from bt_users "
+            "where started_at is not null order by balance desc limit $1",
+            limit)
+        rows = [_row(r) for r in recs]
+    except Exception as e:  # noqa: BLE001
+        if not pgpool.should_fallback(e):
+            raise
+        rows = await _leaderboard_rich_rest(limit)
+    cache.put(key, rows, _LB_CACHE_TTL)
+    return rows
+
+
+async def _rich_rank_rest(balance: int) -> int:
     client = _get_client()
     r = await client.get("/bt_users",
                          params={"select": "tg_id", "balance": f"gt.{balance}",
@@ -835,18 +911,52 @@ async def rich_rank(tg_id: int, balance: int) -> int:
     return (int(total) + 1) if total.isdigit() else 1
 
 
+async def rich_rank(tg_id: int, balance: int) -> int:
+    """1-based rank on the rich list = count(registered users with balance > mine) + 1.
+
+    Direct-DB count (REST fallback), cached briefly per (user, balance): the
+    balance is part of the key, so the user's own wins/losses miss the cache
+    naturally and only same-balance repeat views (e.g. /me polling) are served
+    from it.
+    """
+    key = f"richrank:{tg_id}:{balance}"
+    hit = cache.get(key)
+    if hit is not None:
+        return hit
+    try:
+        pool = await pgpool.get_pool()
+        n = await pool.fetchval(
+            "select count(*) from bt_users "
+            "where started_at is not null and balance > $1", balance)
+        rank = int(n) + 1
+    except Exception as e:  # noqa: BLE001
+        if not pgpool.should_fallback(e):
+            raise
+        rank = await _rich_rank_rest(balance)
+    cache.put(key, rank, _STATS_CACHE_TTL)
+    return rank
+
+
 async def user_stats(tg_id: int) -> dict:
     """Call ``bt_user_stats`` — single-round-trip home-card stats.
 
     Returns ``{messages_sent, amount_wagered, messages_rank}``.
-    Raises ``SupabaseError`` on failure.
+    Raises ``SupabaseError`` on failure. Cached briefly (display-only card);
+    the cache is dropped alongside the profile on same-process mutations.
     """
+    key = f"stats:{tg_id}"
+    hit = cache.get(key)
+    if hit is not None:
+        return hit
     client = _get_client()
     r = await client.post("/rpc/bt_user_stats", json={"p_tg_id": tg_id})
     if r.status_code >= 400:
         raise SupabaseError(f"bt_user_stats failed: {r.status_code} {r.text[:200]}")
     data = r.json()
-    return data if isinstance(data, dict) else {}
+    out = data if isinstance(data, dict) else {}
+    if out:
+        cache.put(key, out, _STATS_CACHE_TTL)
+    return out
 
 
 async def claim_backlog(tg_id: int) -> dict:
@@ -869,13 +979,39 @@ async def claim_backlog(tg_id: int) -> dict:
     return data if isinstance(data, dict) else {"awarded": 0, "new_balance": 0}
 
 
-async def chat_counts_since(start_day: str) -> list[dict]:
-    """All `bt_chat_counts` rows on/after ``start_day`` (UTC ISO date), aggregated
-    in Python. Powers the chatters leaderboard, which ranks by the number of
-    messages sent (not points earned)."""
+async def _chat_counts_since_rest(start_day: str) -> list[dict]:
     return await _get("bt_chat_counts",
                       {"select": "tg_id,count", "day": f"gte.{start_day}",
                        "limit": "100000"})
+
+
+async def chat_counts_since(start_day: str) -> list[dict]:
+    """Per-user message totals on/after ``start_day`` (UTC ISO date), as
+    ``[{tg_id, count}]``. Powers the chatters leaderboard (ranks by messages
+    sent, not points earned).
+
+    Direct-DB with the SUM/GROUP BY pushed server-side (one small result set
+    instead of shipping every per-day row), REST fallback (per-day rows,
+    aggregated by the caller — both shapes sum identically). Cached briefly:
+    the board is shared by every caller.
+    """
+    key = f"lb:chat:{start_day}"
+    hit = cache.get(key)
+    if hit is not None:
+        return hit
+    try:
+        pool = await pgpool.get_pool()
+        recs = await pool.fetch(
+            "select tg_id, sum(count)::bigint as count from bt_chat_counts "
+            "where day >= $1::date group by tg_id",
+            start_day)
+        rows = [_row(r) for r in recs]
+    except Exception as e:  # noqa: BLE001
+        if not pgpool.should_fallback(e):
+            raise
+        rows = await _chat_counts_since_rest(start_day)
+    cache.put(key, rows, _LB_CACHE_TTL)
+    return rows
 
 
 async def ledger_totals_since(
@@ -961,21 +1097,31 @@ async def get_log_chat_id() -> int | None:
         return None
 
 
-async def display_names(tg_ids: list[int]) -> dict[int, str]:
-    if not tg_ids:
-        return {}
+async def _display_names_rest(tg_ids: list[int]) -> dict[int, str]:
     ids = ",".join(str(i) for i in tg_ids)
     rows = await _get("bt_users", {"select": "tg_id,display_name", "tg_id": f"in.({ids})"})
     return {int(r["tg_id"]): (r.get("display_name") or str(r["tg_id"])) for r in rows}
 
 
-async def registered_ids(tg_ids: list[int]) -> set[int]:
-    """Subset of ``tg_ids`` whose users are registered (``started_at`` set).
+async def display_names(tg_ids: list[int]) -> dict[int, str]:
+    """``{tg_id: display_name-or-id}`` for the given users (direct-DB, REST
+    fallback)."""
+    if not tg_ids:
+        return {}
+    try:
+        pool = await pgpool.get_pool()
+        recs = await pool.fetch(
+            "select tg_id, display_name from bt_users where tg_id = any($1::bigint[])",
+            [int(i) for i in tg_ids])
+        return {int(r["tg_id"]): (r["display_name"] or str(r["tg_id"])) for r in recs}
+    except Exception as e:  # noqa: BLE001
+        if pgpool.should_fallback(e):
+            return await _display_names_rest(tg_ids)
+        raise
 
-    The Rich leaderboard is registered-only: unregistered chatters keep their
-    points and their spot on Chatters, but never appear on Rich. Batched to stay
-    well under PostgREST URL-length limits on large weeks."""
-    uniq = list({int(i) for i in tg_ids})
+
+async def _registered_ids_rest(uniq: list[int]) -> set[int]:
+    # Batched to stay well under PostgREST URL-length limits on large weeks.
     out: set[int] = set()
     for i in range(0, len(uniq), 150):
         chunk = ",".join(str(x) for x in uniq[i:i + 150])
@@ -984,3 +1130,25 @@ async def registered_ids(tg_ids: list[int]) -> set[int]:
                            "started_at": "not.is.null"})
         out.update(int(r["tg_id"]) for r in rows)
     return out
+
+
+async def registered_ids(tg_ids: list[int]) -> set[int]:
+    """Subset of ``tg_ids`` whose users are registered (``started_at`` set).
+
+    The Rich leaderboard is registered-only: unregistered chatters keep their
+    points and their spot on Chatters, but never appear on Rich. Direct-DB
+    (one ANY() query regardless of week size), REST fallback (chunked)."""
+    uniq = list({int(i) for i in tg_ids})
+    if not uniq:
+        return set()
+    try:
+        pool = await pgpool.get_pool()
+        recs = await pool.fetch(
+            "select tg_id from bt_users "
+            "where started_at is not null and tg_id = any($1::bigint[])",
+            uniq)
+        return {int(r["tg_id"]) for r in recs}
+    except Exception as e:  # noqa: BLE001
+        if pgpool.should_fallback(e):
+            return await _registered_ids_rest(uniq)
+        raise
