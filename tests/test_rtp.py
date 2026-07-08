@@ -2,10 +2,13 @@
 
 For every game and every valid configuration/decision point:
 
-    sum_over_outcomes  P(outcome) * M(outcome)  ==  1 - EPS   (+/- 1e-9)
+    sum_over_outcomes  P(outcome) * M(outcome)  ==  RTP target   (+/- 1e-9)
 
-Multi-step games (flip, mines, towers, highlow) satisfy the identity at each
-decision: P(reaching the state) * M(state) + P(busting) * 0 == 1 - EPS.
+The target is ``1 - EPS`` for dice, flip and plinko. Three games deviate on
+purpose: mines front-loads its edge (target ``MULT_SCALE * (1 - edge(k))``),
+towers damps its whole ladder (target ``MULT_SCALE * (1 - EPS)``), and highlow
+uses its own ``HL_EPS``. Multi-step games satisfy their identity at each
+decision: P(reaching the state) * M(state) + P(busting) * 0 == target.
 """
 
 import math
@@ -40,9 +43,12 @@ def test_mines_rtp():
 
 
 def test_towers_rtp():
+    # Towers is uniformly damped 15% below the flat-EPS identity (operator
+    # decision): RTP == MULT_SCALE * (1 - EPS) at every decision point.
+    towers_target = towers.MULT_SCALE * TARGET
     for difficulty in towers.DIFFICULTIES:
         for level in range(0, 12):
-            assert abs(_rtp(towers.rtp_distribution(level, difficulty)) - TARGET) < TOL
+            assert abs(_rtp(towers.rtp_distribution(level, difficulty)) - towers_target) < TOL
 
 
 def test_highlow_rtp():

@@ -1,12 +1,15 @@
 """Towers — multi-step (spec §7.4).
 
-    M_tower(L) = (1 - EPS) * (C / (C - t))^L
+    M_tower(L) = MULT_SCALE * (1 - EPS) * (C / (C - t))^L
 
-| Difficulty | C | t | per-floor |
-|-----------|---|---|-----------|
-| easy      | 4 | 1 | 1.3175x   |
-| medium    | 3 | 1 | 1.485x    |
-| hard      | 2 | 1 | 1.98x     |
+``MULT_SCALE`` (0.85) uniformly damps the whole ladder 15% below the flat-EPS
+identity (operator decision), so towers pays less than the other flat-edge games.
+
+| Difficulty | C | t | growth/floor | M(1)     |
+|-----------|---|---|--------------|----------|
+| easy      | 4 | 1 | x1.3333      | 1.1107x  |
+| medium    | 3 | 1 | x1.5         | 1.2495x  |
+| hard      | 2 | 1 | x2           | 1.6660x  |
 
 One trap position per floor from the seeded RNG. Client calls ``/step`` per floor
 pick, ``/cashout`` to lock. Trap hit -> settle with payout 0.
@@ -19,6 +22,10 @@ from .seed import rng_int
 # global MULT_CAP may end a run earlier (notably on hard, which doubles each
 # floor and would otherwise reach ~253x at floor 8).
 FLOORS = 8
+
+# Uniform damp on the whole multiplier ladder (operator decision: towers pays
+# 15% below the flat-EPS identity). The RTP test asserts MULT_SCALE * (1 - EPS).
+MULT_SCALE = 0.85
 
 DIFFICULTIES = {
     "easy": {"C": 4, "t": 1},
@@ -38,7 +45,7 @@ def columns(difficulty: str) -> int:
 def multiplier(level: int, difficulty: str) -> float:
     d = DIFFICULTIES[difficulty]
     C, t = d["C"], d["t"]
-    return (1 - EPS) * (C / (C - t)) ** level
+    return MULT_SCALE * (1 - EPS) * (C / (C - t)) ** level
 
 
 def trap_positions(server_seed: str, client_seed: str, nonce: int, floor: int, difficulty: str) -> list[int]:

@@ -1,6 +1,6 @@
 """Flip — chainable multi-step (spec §7.2).
 
-    M_flip(k) = 1.98^k     (per flip factor = (1 - EPS) / 0.5 = 1.98)
+    M_flip(k) = 1.96^k     (per flip factor = (1 - EPS) / 0.5 = 1.96)
 
 Each flip is one RNG draw; win with probability 0.5. Client calls ``/step`` per
 flip and ``/cashout`` to lock the accumulated multiplier.
@@ -8,9 +8,9 @@ flip and ``/cashout`` to lock the accumulated multiplier.
 
 from . import EPS
 
-# (1 - EPS) / p_win with p_win = 0.5 -> 1.98
+# (1 - EPS) / p_win with p_win = 0.5 -> 1.96
 P_WIN = 0.5
-FACTOR = (1 - EPS) / P_WIN  # 1.98
+FACTOR = (1 - EPS) / P_WIN  # 1.96
 
 
 def multiplier(streak: int) -> float:

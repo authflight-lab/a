@@ -5,8 +5,9 @@
 
 Deck is ranks 1..13. Uses the "Rainbet" rule: a tie (next card equals current
 rank) counts as a WIN for whichever direction was picked ("higher or same" /
-"lower or same"). HighLow carries its OWN house edge ``HL_EPS`` (larger than the
-global ``EPS``) because its multipliers chain and can compound quickly.
+"lower or same"). HighLow carries its OWN house edge ``HL_EPS`` (a separate
+constant from the global ``EPS``, currently the same 2%) because its multipliers
+chain and can compound quickly.
 
 Two guards keep payouts sane for a points economy:
 
@@ -22,8 +23,8 @@ Two guards keep payouts sane for a points economy:
 
 from . import MULT_CAP
 
-# HighLow-specific house edge (2%). Slightly larger than the global EPS (1%);
-# other games are unaffected.
+# HighLow-specific house edge (2%). Kept as a SEPARATE constant from the global
+# EPS (now also 2%) on purpose — they can diverge again; other games are unaffected.
 HL_EPS = 0.02
 
 RANKS = 13
