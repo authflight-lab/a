@@ -1252,7 +1252,7 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
             zone = int(raw_zone)
         except (TypeError, ValueError):
             return _err("invalid_move")
-        if zone < 0 or zone >= chicken.zones(difficulty):
+        if zone < 0 or zone >= chicken.zones(difficulty, lane):
             return _err("invalid_move")
         cars = set(chicken.car_zones(ss, cs, nonce, lane, difficulty))
         if zone in cars:
@@ -1264,8 +1264,8 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
         new_lane = lane + 1
         raw = chicken.multiplier(new_lane, difficulty)
         mult = min(raw, chicken.CHICKEN_MAX_MULT)
-        # Auto-cash on the far side of the road OR once the 20x cap is reached
-        # (hard/daredevil ladders would otherwise blow past it in a few lanes).
+        # Auto-cash on the far side of the road OR once the 24x cap is reached
+        # (they coincide on the easy ladder; the cap also guards legacy rounds).
         done = new_lane >= chicken.LANES or raw >= chicken.CHICKEN_MAX_MULT
         new_state = {"lane": new_lane, "difficulty": difficulty, "multiplier": mult}
         if done:
