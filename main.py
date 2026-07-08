@@ -66,7 +66,27 @@ async def _cashout_stale_round(rnd: dict) -> None:
     ss, cs, nonce = rnd["server_seed"], rnd["client_seed"], int(rnd["nonce"])
 
     try:
-        if name not in MULTI_STEP:
+        if name == "blackjack":
+            # A stale hand settles as a STAND on the player's current cards —
+            # the least-punitive deterministic resolution (mirrors how the
+            # multi-step games below settle at their current progression
+            # instead of being abandoned). The dealer plays out S17 from the
+            # stored cursor with the round's own seeded draws, so the result
+            # is exactly what /step stand would have produced. Naturals settle
+            # at bet time, so an open round always has a live, un-busted hand.
+            player = list(state.get("player") or [])
+            dealer = list(state.get("dealer") or [])
+            cursor = int(state.get("next_cursor", 4))
+            if len(player) < 2 or len(dealer) < 2:
+                mult, outcome = 0.0, {"multiplier": 0.0}
+            else:
+                draw = lambda i: rng_float(ss, cs, nonce, i)
+                dealer, cursor = blackjack.play_dealer(draw, dealer, cursor)
+                mult = blackjack.outcome_multiplier(player, dealer)
+                outcome = {"player": player, "dealer": dealer, "next_cursor": cursor,
+                           "doubled": bool(state.get("doubled")), "player_done": True,
+                           "multiplier": mult}
+        elif name not in MULTI_STEP:
             # Single-settle games (dice/plinko) that somehow stayed open, and
             # crash rounds never cashed out (the curve crashed unclaimed): abandon.
             await db.close_round(rnd["id"], {
@@ -75,7 +95,7 @@ async def _cashout_stale_round(rnd: dict) -> None:
             })
             return
 
-        if name == "flip":
+        elif name == "flip":
             streak = int(state.get("streak", 0))
             mult = min(flip.multiplier(streak), MULT_CAP) if streak > 0 else 0.0
             outcome = {"streak": streak, "multiplier": mult}
@@ -1401,9 +1421,12 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
                 outcome = {"player": player, "dealer": dealer, "next_cursor": cursor,
                            "doubled": True, "player_done": True, "busted": True}
                 final = await _finalise(rnd, tg_id, 0.0, "settled", outcome)
+                # `bet` = the DOUBLED stake: the client session tracker uses a
+                # settle's declared final stake (it only knew the original bet
+                # at open time, and the wager doubled mid-round).
                 return {"outcome_step": {"player": player, "busted": True}, "multiplier": 0.0,
                         "can_cashout": False, "busted": True, "done": True,
-                        "balance": bal["balance"], **final}
+                        "balance": bal["balance"], "bet": int(rnd["bet"]), **final}
             dealer, cursor = blackjack.play_dealer(draw, dealer, cursor)
             mult = blackjack.outcome_multiplier(player, dealer)
             outcome = {"player": player, "dealer": dealer, "next_cursor": cursor,
@@ -1411,7 +1434,7 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
             final = await _finalise(rnd, tg_id, mult, "settled", outcome)
             return {"outcome_step": {"player": player, "dealer": dealer}, "multiplier": mult,
                     "can_cashout": False, "busted": False, "done": True,
-                    "balance": bal["balance"], **final}
+                    "balance": bal["balance"], "bet": int(rnd["bet"]), **final}
 
         if action == "hit":
             player.append(blackjack.draw_card(draw, cursor))
