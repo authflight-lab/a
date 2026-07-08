@@ -175,13 +175,13 @@ app.add_middleware(
 
 @app.middleware("http")
 async def _ip_rate_limit_middleware(request: Request, call_next):
-    """Pre-auth IP-level guard: 120 req / 60 s per IP across all /bt/api/ routes."""
+    """Pre-auth IP-level guard per IP across all /bt/api/ routes (config bt_rl_ip_*)."""
     if request.url.path.startswith("/bt/api/"):
         xff = request.headers.get("X-Forwarded-For")
         ip = xff.split(",")[0].strip() if xff else (
             request.client.host if request.client else "unknown"
         )
-        allowed, retry_after = ratelimit.check(f"ip:{ip}", limit=120, window_sec=60)
+        allowed, retry_after = ratelimit.check(f"ip:{ip}", limit=settings.bt_rl_ip_limit, window_sec=settings.bt_rl_ip_window_sec)
         if not allowed:
             return JSONResponse(
                 status_code=429,
@@ -368,7 +368,7 @@ async def pgprobe(n: int = 20, x_probe_token: str = Header("")):
 @app.get("/bt/api/me")
 async def me(user: dict = Depends(require_user)):
     tg_id = user["tg_id"]
-    allowed, retry_after = ratelimit.check(f"me:{tg_id}", limit=60, window_sec=60)
+    allowed, retry_after = ratelimit.check(f"me:{tg_id}", limit=settings.bt_rl_me_limit, window_sec=settings.bt_rl_me_window_sec)
     if not allowed:
         return _rl_err(retry_after)
     # Opening the Mini App is the definitive "started the app" signal, so stamp
@@ -529,7 +529,7 @@ async def age_ack(user: dict = Depends(require_user)):
 @app.get("/bt/api/rewards")
 async def rewards(_user: dict = Depends(require_user)):
     tg_id = _user["tg_id"]
-    allowed, retry_after = ratelimit.check(f"rewards:{tg_id}", limit=20, window_sec=60)
+    allowed, retry_after = ratelimit.check(f"rewards:{tg_id}", limit=settings.bt_rl_read_limit, window_sec=settings.bt_rl_read_window_sec)
     if not allowed:
         return _rl_err(retry_after)
     period = STOCK_PERIOD
@@ -668,7 +668,7 @@ async def leaderboard(
     tab: str = "rich", period: str = "weekly", user: dict = Depends(require_user)
 ):
     tg_id = user["tg_id"]
-    allowed, retry_after = ratelimit.check(f"leaderboard:{tg_id}", limit=20, window_sec=60)
+    allowed, retry_after = ratelimit.check(f"leaderboard:{tg_id}", limit=settings.bt_rl_read_limit, window_sec=settings.bt_rl_read_window_sec)
     if not allowed:
         return _rl_err(retry_after)
     if tab not in ("rich", "chatters"):
@@ -730,7 +730,7 @@ async def leaderboard(
 @app.get("/bt/api/history")
 async def history(user: dict = Depends(require_user)):
     tg_id = user["tg_id"]
-    allowed, retry_after = ratelimit.check(f"history:{tg_id}", limit=20, window_sec=60)
+    allowed, retry_after = ratelimit.check(f"history:{tg_id}", limit=settings.bt_rl_read_limit, window_sec=settings.bt_rl_read_window_sec)
     if not allowed:
         return _rl_err(retry_after)
     rows = await db.ledger_history(tg_id, limit=50)
@@ -745,7 +745,7 @@ async def history(user: dict = Depends(require_user)):
 async def bets(user: dict = Depends(require_user)):
     """Last 50 resolved game rounds for the caller (bet-history panel)."""
     tg_id = user["tg_id"]
-    allowed, retry_after = ratelimit.check(f"bets:{tg_id}", limit=20, window_sec=60)
+    allowed, retry_after = ratelimit.check(f"bets:{tg_id}", limit=settings.bt_rl_read_limit, window_sec=settings.bt_rl_read_window_sec)
     if not allowed:
         return _rl_err(retry_after)
     rows = await db.rounds_history(tg_id, limit=50)
@@ -840,7 +840,7 @@ async def game_seeds_rotate(user: dict = Depends(require_user), body: dict | Non
     """Rotate the active pair: reveal the retired server_seed, promote the
     pre-committed next one, apply an optional new client seed, reset the nonce."""
     tg_id = user["tg_id"]
-    allowed, retry_after = ratelimit.check(f"game:{tg_id}", limit=60, window_sec=60)
+    allowed, retry_after = ratelimit.check(f"game:{tg_id}", limit=settings.bt_rl_game_limit, window_sec=settings.bt_rl_game_window_sec)
     if not allowed:
         return _rl_err(retry_after)
     body = body or {}
@@ -875,7 +875,7 @@ async def _open_bet(name: str, user: dict, body: dict | None):
     if name not in GAMES:
         return None, None, _err("unknown_game", 404)
     tg_id = user["tg_id"]
-    allowed, retry_after = ratelimit.check(f"game:{tg_id}", limit=60, window_sec=60)
+    allowed, retry_after = ratelimit.check(f"game:{tg_id}", limit=settings.bt_rl_game_limit, window_sec=settings.bt_rl_game_window_sec)
     if not allowed:
         return None, None, _rl_err(retry_after)
 
@@ -1113,7 +1113,7 @@ async def game_settle(name: str, user: dict = Depends(require_user), body: dict 
     if name not in SINGLE_SETTLE:
         return _err("invalid_action")
     tg_id = user["tg_id"]
-    allowed, retry_after = ratelimit.check(f"game:{tg_id}", limit=60, window_sec=60)
+    allowed, retry_after = ratelimit.check(f"game:{tg_id}", limit=settings.bt_rl_game_limit, window_sec=settings.bt_rl_game_window_sec)
     if not allowed:
         return _rl_err(retry_after)
     body = body or {}
@@ -1174,7 +1174,7 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
     if name not in MULTI_STEP:
         return _err("invalid_action")
     tg_id = user["tg_id"]
-    allowed, retry_after = ratelimit.check(f"game:{tg_id}", limit=60, window_sec=60)
+    allowed, retry_after = ratelimit.check(f"game:{tg_id}", limit=settings.bt_rl_game_limit, window_sec=settings.bt_rl_game_window_sec)
     if not allowed:
         return _rl_err(retry_after)
     body = body or {}
@@ -1428,7 +1428,7 @@ async def game_cashout(name: str, user: dict = Depends(require_user), body: dict
     if name not in MULTI_STEP and name != "crash":
         return _err("invalid_action")
     tg_id = user["tg_id"]
-    allowed, retry_after = ratelimit.check(f"game:{tg_id}", limit=60, window_sec=60)
+    allowed, retry_after = ratelimit.check(f"game:{tg_id}", limit=settings.bt_rl_game_limit, window_sec=settings.bt_rl_game_window_sec)
     if not allowed:
         return _rl_err(retry_after)
     body = body or {}

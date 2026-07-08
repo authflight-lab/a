@@ -42,12 +42,38 @@ class Settings:
     # Exact origin of the deployed Mini App; the CORS allowlist is built from this.
     bt_app_origin: str = ""
 
+    # ── Rate limits (env-overridable, e.g. BT_RL_GAME_LIMIT=90) ──────────────
+    # Pre-auth per-IP guard across all /bt/api/ routes. Generous because mobile
+    # carriers (CGNAT) pool many legit users behind one IP.
+    bt_rl_ip_limit: int = 600
+    bt_rl_ip_window_sec: int = 60
+    # Per-user game bucket, shared by bet + every step + cashout. Short window
+    # so tap bursts recover in seconds and Retry-After stays small.
+    # 60 / 15 s ≈ 240 req/min sustained — above the fastest human tapping.
+    bt_rl_game_limit: int = 60
+    bt_rl_game_window_sec: int = 15
+    # Per-user /me profile reads.
+    bt_rl_me_limit: int = 120
+    bt_rl_me_window_sec: int = 60
+    # Per-user read endpoints (leaderboard, history, bets, rewards).
+    bt_rl_read_limit: int = 40
+    bt_rl_read_window_sec: int = 60
+
     def __post_init__(self) -> None:
         # Environment overrides (same field name, upper-cased) win when present.
+        # Values are coerced to the field's declared type (int fields via int()).
         for f in fields(self):
             env_val = os.environ.get(f.name.upper())
             if env_val is not None and env_val != "":
-                setattr(self, f.name, env_val)
+                if f.type is int or f.type == "int":
+                    try:
+                        parsed = int(env_val)
+                    except ValueError:
+                        continue  # keep the safe default on a malformed override
+                    if parsed > 0:  # zero/negative limits would break the limiter
+                        setattr(self, f.name, parsed)
+                else:
+                    setattr(self, f.name, env_val)
 
 
 settings = Settings()
