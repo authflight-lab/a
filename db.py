@@ -215,7 +215,7 @@ async def redeem(tg_id: int, reward_id: str, period: str) -> dict:
             body = r.text
         except Exception:
             pass
-        for code in ("insufficient_balance", "monthly_limit_reached", "daily_limit_reached", "reward_inactive"):
+        for code in ("insufficient_balance", "monthly_limit_reached", "daily_limit_reached", "reward_inactive", "dev_account"):
             if code in body:
                 raise RedeemError(code)
         if "reward_not_found" in body:
@@ -873,13 +873,13 @@ async def _leaderboard_rich_rest(limit: int = 20) -> list[dict]:
     return await _get("bt_users",
                       {"select": "tg_id,display_name,balance",
                        "order": "balance.desc", "limit": str(limit),
-                       "started_at": "not.is.null"})
+                       "started_at": "not.is.null", "is_dev": "is.false"})
 
 
 async def leaderboard_rich(limit: int = 20) -> list[dict]:
-    """Top registered balances (direct-DB, REST fallback), cached briefly:
-    the whole board is shared by every caller and the bt_users_balance_idx
-    read is pointless to repeat 20x/minute per user."""
+    """Top registered, non-dev balances (direct-DB, REST fallback), cached
+    briefly: the whole board is shared by every caller and the
+    bt_users_balance_idx read is pointless to repeat 20x/minute per user."""
     key = f"lb:rich:alltime:{limit}"
     hit = cache.get(key)
     if hit is not None:
@@ -888,7 +888,8 @@ async def leaderboard_rich(limit: int = 20) -> list[dict]:
         pool = await pgpool.get_pool()
         recs = await pool.fetch(
             "select tg_id, display_name, balance from bt_users "
-            "where started_at is not null order by balance desc limit $1",
+            "where started_at is not null and not is_dev "
+            "order by balance desc limit $1",
             limit)
         rows = [_row(r) for r in recs]
     except Exception as e:  # noqa: BLE001
@@ -899,11 +900,41 @@ async def leaderboard_rich(limit: int = 20) -> list[dict]:
     return rows
 
 
+async def _dev_ids_all_rest() -> set[int]:
+    rows = await _get("bt_users",
+                      {"select": "tg_id", "is_dev": "is.true", "limit": "1000"})
+    return {int(r["tg_id"]) for r in rows}
+
+
+async def dev_ids_all() -> set[int]:
+    """Every dev-flagged tg_id (tiny partial-index scan, cached briefly).
+
+    Dev accounts (/dev) are hidden from both leaderboards. The set is shared
+    by every leaderboard caller, so one short-lived cache entry covers them
+    all; a flag flip is visible within the TTL. Direct-DB, REST fallback —
+    failures propagate (the leaderboard should error, not quietly include a
+    dev account)."""
+    key = "devids:all"
+    hit = cache.get(key)
+    if hit is not None:
+        return hit
+    try:
+        pool = await pgpool.get_pool()
+        recs = await pool.fetch("select tg_id from bt_users where is_dev")
+        ids = {int(r["tg_id"]) for r in recs}
+    except Exception as e:  # noqa: BLE001
+        if not pgpool.should_fallback(e):
+            raise
+        ids = await _dev_ids_all_rest()
+    cache.put(key, ids, _LB_CACHE_TTL)
+    return ids
+
+
 async def _rich_rank_rest(balance: int) -> int:
     client = _get_client()
     r = await client.get("/bt_users",
                          params={"select": "tg_id", "balance": f"gt.{balance}",
-                                 "started_at": "not.is.null"},
+                                 "started_at": "not.is.null", "is_dev": "is.false"},
                          headers={"Prefer": "count=exact", "Range-Unit": "items", "Range": "0-0"})
     r.raise_for_status()
     cr = r.headers.get("content-range", "*/0")
@@ -912,7 +943,8 @@ async def _rich_rank_rest(balance: int) -> int:
 
 
 async def rich_rank(tg_id: int, balance: int) -> int:
-    """1-based rank on the rich list = count(registered users with balance > mine) + 1.
+    """1-based rank on the rich list = count(registered, non-dev users with
+    balance > mine) + 1.
 
     Direct-DB count (REST fallback), cached briefly per (user, balance): the
     balance is part of the key, so the user's own wins/losses miss the cache
@@ -927,7 +959,8 @@ async def rich_rank(tg_id: int, balance: int) -> int:
         pool = await pgpool.get_pool()
         n = await pool.fetchval(
             "select count(*) from bt_users "
-            "where started_at is not null and balance > $1", balance)
+            "where started_at is not null and not is_dev and balance > $1",
+            balance)
         rank = int(n) + 1
     except Exception as e:  # noqa: BLE001
         if not pgpool.should_fallback(e):

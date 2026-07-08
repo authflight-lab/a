@@ -569,6 +569,11 @@ async def redeem(user: dict = Depends(require_user), body: dict | None = Body(de
     if not allowed:
         return _rl_err(retry_after)
 
+    # Dev accounts (/dev) can play and earn but never claim shop rewards.
+    u = await db.get_user_cached(tg_id)
+    if u is not None and u.get("is_dev"):
+        return {"ok": False, "error": "dev_account"}
+
     # Activity floor first (spec §5): today's chatted AND claimed (UTC).
     quest = await db.get_quest(tg_id, _today())
     if not (quest and quest.get("chatted") and quest.get("claimed")):
@@ -689,7 +694,8 @@ async def leaderboard(
             u = await db.get_user_cached(tg_id)
             you = None
             # Rich is registered-only; an unregistered caller has no Rich rank.
-            if u is not None and u.get("started_at"):
+            # Dev accounts are hidden from ranks entirely — no "you" row either.
+            if u is not None and u.get("started_at") and not u.get("is_dev"):
                 bal = int(u.get("balance", 0))
                 you = {"rank": await db.rich_rank(tg_id, bal), "value": bal}
             return {"tab": tab, "period": period, "rows": rows, "you": you}
@@ -709,6 +715,11 @@ async def leaderboard(
             # their points and their Chatters spot, but never rank on Rich).
             reg = await db.registered_ids(list(totals.keys()))
             totals = {uid: v for uid, v in totals.items() if uid in reg}
+            # Dev accounts (/dev) are hidden from ranks; dropping them from
+            # the shared totals map also suppresses a dev caller's "you" row.
+            devs = await db.dev_ids_all()
+            if devs:
+                totals = {uid: v for uid, v in totals.items() if uid not in devs}
             cache.put(cache_key, totals, db._LB_CACHE_TTL)
         rows, you = await _rows_from_totals(totals, tg_id)
         return {"tab": tab, "period": period, "rows": rows, "you": you,
@@ -717,9 +728,15 @@ async def leaderboard(
     # chatters: raw messages sent (ranked by message count, not points earned).
     start_day = _week_start()[:10] if period == "weekly" else _EPOCH[:10]
     counts = await db.chat_counts_since(start_day)
+    devs = await db.dev_ids_all()
     totals = defaultdict(int)
     for row in counts:
-        totals[int(row["tg_id"])] += int(row["count"])
+        uid = int(row["tg_id"])
+        if uid in devs:
+            # Dev accounts (/dev) are hidden from ranks (and their own "you"
+            # row); their messages still count for quests/giveaways elsewhere.
+            continue
+        totals[uid] += int(row["count"])
     rows, you = await _rows_from_totals(totals, tg_id)
     resp = {"tab": tab, "period": period, "rows": rows, "you": you}
     if period == "weekly":
