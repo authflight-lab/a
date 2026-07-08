@@ -803,6 +803,18 @@ async def ledger_history(tg_id: int, limit: int = 50) -> list[dict]:
                        "order": "created_at.desc", "limit": str(limit)})
 
 
+async def rounds_history(tg_id: int, limit: int = 50) -> list[dict]:
+    """The user's most recent resolved bets, newest first.
+
+    Only true wagering outcomes (settled / cashed_out) — abandoned or voided
+    rounds are not bets and would show misleading 0.00x multipliers.
+    """
+    return await _get("bt_game_rounds",
+                      {"tg_id": f"eq.{tg_id}", "status": "in.(settled,cashed_out)",
+                       "select": "id,game,bet,payout,status,created_at,settled_at",
+                       "order": "created_at.desc", "limit": str(limit)})
+
+
 async def leaderboard_rich(limit: int = 20) -> list[dict]:
     return await _get("bt_users",
                       {"select": "tg_id,display_name,balance",

@@ -714,6 +714,22 @@ async def history(user: dict = Depends(require_user)):
     ]}
 
 
+@app.get("/bt/api/bets")
+async def bets(user: dict = Depends(require_user)):
+    """Last 50 resolved game rounds for the caller (bet-history panel)."""
+    tg_id = user["tg_id"]
+    allowed, retry_after = ratelimit.check(f"bets:{tg_id}", limit=20, window_sec=60)
+    if not allowed:
+        return _rl_err(retry_after)
+    rows = await db.rounds_history(tg_id, limit=50)
+    return {"rows": [
+        {"id": r.get("id"), "game": r.get("game"), "bet": int(r.get("bet") or 0),
+         "payout": int(r.get("payout") or 0), "status": r.get("status"),
+         "created_at": r.get("created_at"), "settled_at": r.get("settled_at")}
+        for r in rows
+    ]}
+
+
 # ---------------------------------------------------------------------------
 # Games
 # ---------------------------------------------------------------------------
