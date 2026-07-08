@@ -224,13 +224,10 @@ def _utc_day_start() -> str:
     return now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
 
 
-def _period() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m")
-
-
-def _period_start() -> str:
-    now = datetime.now(timezone.utc)
-    return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+# Reward stock is a plain counter (no monthly reset): all usage rows live under
+# this single constant period key, so `monthly_limit - used` is the current
+# stock and /restock overrides it by setting monthly_limit = used + amount.
+STOCK_PERIOD = "ALL"
 
 
 # Beginning of time — used as an "all-time" lower bound for ledger scans.
@@ -503,7 +500,7 @@ async def rewards(_user: dict = Depends(require_user)):
     allowed, retry_after = ratelimit.check(f"rewards:{tg_id}", limit=20, window_sec=60)
     if not allowed:
         return _rl_err(retry_after)
-    period = _period()
+    period = STOCK_PERIOD
     items = await db.list_rewards(active_only=True)
     out = []
     for r in items:
@@ -546,11 +543,11 @@ async def redeem(user: dict = Depends(require_user), body: dict | None = Body(de
     if await db.has_redeemed_today(tg_id, _utc_day_start()):
         return {"ok": False, "error": "daily_limit_reached"}
 
-    # Atomic debit + monthly-usage increment + redemption row (spec §14) via the
-    # bt_redeem RPC — reward/active/monthly-limit/balance are all enforced inside
-    # one transaction, closing the read-then-write race on monthly_limit.
+    # Atomic debit + stock-usage increment + redemption row (spec §14) via the
+    # bt_redeem RPC — reward/active/stock/balance are all enforced inside one
+    # transaction, closing the read-then-write race on the stock counter.
     try:
-        result = await db.redeem(tg_id, reward_id, _period())
+        result = await db.redeem(tg_id, reward_id, STOCK_PERIOD)
     except db.RedeemError as e:
         return {"ok": False, "error": e.code}
 
@@ -583,7 +580,7 @@ async def redeem(user: dict = Depends(require_user), body: dict | None = Body(de
                 # bt_redeem already incremented usage for THIS request, so add
                 # it back to show the pre-claim stock the "(-1 after claimed)"
                 # wording refers to.
-                used = await db.get_reward_usage(reward_id, _period())
+                used = await db.get_reward_usage(reward_id, STOCK_PERIOD)
                 stock = str(max(0, limit - used + 1))
             name_parts = (user.get("display_name") or "").split()
             first_name = name_parts[0] if name_parts else str(tg_id)
