@@ -28,7 +28,7 @@ from .auth import require_user
 from .config import settings
 from .db import InsufficientBalance, SupabaseNotConfigured
 from .game import BET_MAX, BET_MIN, GAMES, MULT_CAP, MULTI_STEP, P_MAX, SINGLE_SETTLE
-from .game import dice, flip, highlow, mines, plinko, rps, seedpair, towers
+from .game import chicken, dice, flip, highlow, mines, plinko, rps, seedpair, towers
 from .game.seed import rng_float
 
 app = FastAPI(title="Bartender API", version="1.0")
@@ -104,6 +104,16 @@ async def _cashout_stale_round(rnd: dict) -> None:
             else:
                 mult = min(rps.multiplier(wins), rps.RPS_MAX_MULT)
                 outcome = {"wins": wins, "step": int(state.get("step", 0)), "multiplier": mult}
+        elif name == "chicken":
+            lane = int(state.get("lane", 0))
+            # No lanes crossed means no wager decision was made; settle at 0
+            # just like the cashout gate.
+            if lane <= 0:
+                mult, outcome = 0.0, {"lane": 0, "multiplier": 0.0}
+            else:
+                difficulty = str(params.get("difficulty", "medium"))
+                mult = min(chicken.multiplier(lane, difficulty), chicken.CHICKEN_MAX_MULT)
+                outcome = {"lane": lane, "difficulty": difficulty, "multiplier": mult}
         else:  # highlow
             step_n = int(state.get("step", 0))
             # Skips advance `step` but not `picks`; a skip-only round has made no
@@ -725,6 +735,9 @@ def _validate_params(name: str, params: dict) -> tuple[bool, dict]:
         return (True, {})
     if name == "rps":
         return (True, {})
+    if name == "chicken":
+        difficulty = str(p.get("difficulty", ""))
+        return (chicken.valid_difficulty(difficulty), {"difficulty": difficulty})
     if name == "plinko":
         rows = int(p.get("rows", 0))
         risk = str(p.get("risk", ""))
@@ -745,6 +758,8 @@ def _initial_state(name: str, np: dict, ss: str, cs: str, nonce: int) -> dict:
         return {"rank": start, "start_card": start, "step": 0, "multiplier": 1.0}
     if name == "rps":
         return {"step": 0, "wins": 0, "multiplier": 1.0}
+    if name == "chicken":
+        return {"lane": 0, "difficulty": np["difficulty"]}
     return {}
 
 
@@ -1212,6 +1227,44 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
         return {"outcome_step": {"floor": floor, "col": col, "safe": True}, "multiplier": mult,
                 "can_cashout": True, "busted": False, "done": False}
 
+    if name == "chicken":
+        difficulty = str(params["difficulty"])
+        lane = int(state.get("lane", 0))
+        # The client sends the crossing zone as {"zone": <idx>} (matching the
+        # other games' dict-shaped moves); accept a bare int/str too.
+        raw_zone = move.get("zone") if isinstance(move, dict) else move
+        if not isinstance(raw_zone, (int, str)):
+            return _err("invalid_move")
+        try:
+            zone = int(raw_zone)
+        except (TypeError, ValueError):
+            return _err("invalid_move")
+        if zone < 0 or zone >= chicken.zones(difficulty):
+            return _err("invalid_move")
+        cars = set(chicken.car_zones(ss, cs, nonce, lane, difficulty))
+        if zone in cars:
+            outcome = {"lane": lane, "zone": zone, "cars": sorted(cars),
+                       "difficulty": difficulty, "busted": True}
+            final = await _finalise(rnd, tg_id, 0.0, "settled", outcome)
+            return {"outcome_step": {"lane": lane, "zone": zone, "safe": False}, "multiplier": 0.0,
+                    "can_cashout": False, "busted": True, "done": True, **final}
+        new_lane = lane + 1
+        raw = chicken.multiplier(new_lane, difficulty)
+        mult = min(raw, chicken.CHICKEN_MAX_MULT)
+        # Auto-cash on the far side of the road OR once the 20x cap is reached
+        # (hard/daredevil ladders would otherwise blow past it in a few lanes).
+        done = new_lane >= chicken.LANES or raw >= chicken.CHICKEN_MAX_MULT
+        new_state = {"lane": new_lane, "difficulty": difficulty, "multiplier": mult}
+        if done:
+            outcome = {**new_state, "cleared": True}
+            final = await _finalise(rnd, tg_id, mult, "cashed_out", outcome)
+            return {"outcome_step": {"lane": lane, "zone": zone, "safe": True}, "multiplier": mult,
+                    "can_cashout": True, "busted": False, "done": True, **final}
+        if not await _persist_step(rnd, new_state):
+            return _err("round_not_open")
+        return {"outcome_step": {"lane": lane, "zone": zone, "safe": True}, "multiplier": mult,
+                "can_cashout": True, "busted": False, "done": False}
+
     if name == "rps":
         # The client sends {"hand": "rock"|"paper"|"scissors"}; accept a bare
         # string too for robustness. One draw per round, cursor = round index
@@ -1360,6 +1413,14 @@ async def game_cashout(name: str, user: dict = Depends(require_user), body: dict
             return _err("must_win_first")
         mult = min(rps.multiplier(wins), rps.RPS_MAX_MULT)
         outcome = {"wins": wins, "step": int(state.get("step", 0)), "multiplier": mult}
+    elif name == "chicken":
+        difficulty = str(params["difficulty"])
+        lane = int(state.get("lane", 0))
+        # Must cross at least one lane before cashing out (no bet-then-cashout).
+        if lane <= 0:
+            return _err("must_cross_first")
+        mult = min(chicken.multiplier(lane, difficulty), chicken.CHICKEN_MAX_MULT)
+        outcome = {"lane": lane, "difficulty": difficulty, "multiplier": mult}
     else:  # highlow
         step_n = int(state.get("step", 0))
         # Must make at least one real pick before cashing out (skips don't count),

@@ -13,7 +13,7 @@ decision: P(reaching the state) * M(state) + P(busting) * 0 == target.
 
 import math
 
-from api.game import EPS, dice, flip, highlow, mines, plinko, rps, towers
+from api.game import EPS, chicken, dice, flip, highlow, mines, plinko, rps, towers
 
 TARGET = 1 - EPS
 TOL = 1e-9
@@ -79,6 +79,37 @@ def test_rps_rules():
     assert rps.house_hand(0.0) == 0
     assert rps.house_hand(0.5) == 1
     assert rps.house_hand(0.999999999) == 2
+
+
+def test_chicken_rtp():
+    # Flat-EPS identity at every decision point, for every difficulty:
+    # P(surviving L lanes) * M(L) + P(hit) * 0 == MULT_SCALE * (1 - EPS).
+    chicken_target = chicken.MULT_SCALE * TARGET
+    for difficulty in chicken.DIFFICULTIES:
+        for lanes in range(0, chicken.LANES + 1):
+            assert abs(_rtp(chicken.rtp_distribution(lanes, difficulty)) - chicken_target) < TOL
+
+
+def test_chicken_ladder():
+    # Per-lane growth matches the spec (~1.47 / 1.96 / 2.94 / 3.92) and every
+    # difficulty crosses the 20x cap within the 8-lane road, so a run always
+    # terminates via auto-cashout or the far side.
+    growth = {"easy": 1.47, "medium": 1.96, "hard": 2.94, "daredevil": 3.92}
+    for difficulty, g in growth.items():
+        assert abs(chicken.multiplier(1, difficulty) - g) < 1e-9
+    # easy is the slowest ladder: it exceeds the cap only on the final lane.
+    assert chicken.multiplier(chicken.LANES - 1, "easy") < chicken.CHICKEN_MAX_MULT
+    assert chicken.multiplier(chicken.LANES, "easy") > chicken.CHICKEN_MAX_MULT
+
+
+def test_chicken_car_zones():
+    # car_zones returns exactly T distinct in-range zones for every lane.
+    ss, cs = "s" * 64, "c" * 64
+    for difficulty, d in chicken.DIFFICULTIES.items():
+        for lane in range(chicken.LANES):
+            cars = chicken.car_zones(ss, cs, 0, lane, difficulty)
+            assert len(cars) == d["T"] == len(set(cars))
+            assert all(0 <= z < d["C"] for z in cars)
 
 
 def test_plinko_rtp():
