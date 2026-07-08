@@ -1407,20 +1407,31 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
             # single-double-per-hand v1 scope.
             if len(player) != 2 or doubled:
                 return _err("invalid_move")
+            # Compute the POST-double committed state (drawn card, advanced
+            # cursor, doubled/player_done flags) BEFORE the atomic debit, so
+            # bt_double_round persists it together with the bet increase. If
+            # the request dies between the RPC and settlement, the open round
+            # is replay-safe: a retried double is rejected (doubled=true,
+            # 3-card hand), and the stale sweeper / a stand settles exactly
+            # the hand this double committed to — no re-charge, no drift.
+            player.append(blackjack.draw_card(draw, cursor))
+            cursor += 1
+            p_total, _ = blackjack.hand_total(player)
+            busted_now = blackjack.is_bust(p_total)
+            committed = {"player": player, "dealer": dealer, "next_cursor": cursor,
+                         "doubled": True, "player_done": True}
+            if busted_now:
+                committed["busted"] = True
             try:
-                bal = await db.double_round(rnd["id"], tg_id, int(rnd["bet"]), state)
+                bal = await db.double_round(rnd["id"], tg_id, int(rnd["bet"]), committed)
             except InsufficientBalance:
                 return _err("insufficient_balance")
             if bal is None:
                 return _err("round_not_open")
             rnd["bet"] = int(bal["bet"])
-            player.append(blackjack.draw_card(draw, cursor))
-            cursor += 1
-            p_total, _ = blackjack.hand_total(player)
-            if blackjack.is_bust(p_total):
-                outcome = {"player": player, "dealer": dealer, "next_cursor": cursor,
-                           "doubled": True, "player_done": True, "busted": True}
-                final = await _finalise(rnd, tg_id, 0.0, "settled", outcome)
+            rnd["outcome"] = dict(committed)  # keep the cached round consistent
+            if busted_now:
+                final = await _finalise(rnd, tg_id, 0.0, "settled", committed)
                 # `bet` = the DOUBLED stake: the client session tracker uses a
                 # settle's declared final stake (it only knew the original bet
                 # at open time, and the wager doubled mid-round).
@@ -1437,6 +1448,12 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
                     "balance": bal["balance"], "bet": int(rnd["bet"]), **final}
 
         if action == "hit":
+            # A committed double (or any player_done state) takes no more
+            # cards — matters if a double's settlement was interrupted after
+            # bt_double_round persisted the doubled hand: the only valid
+            # replays are stand (settles the committed hand) or the sweeper.
+            if doubled or bool(state.get("player_done")):
+                return _err("invalid_move")
             player.append(blackjack.draw_card(draw, cursor))
             cursor += 1
             p_total, _ = blackjack.hand_total(player)
@@ -1445,7 +1462,8 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
                            "doubled": doubled, "player_done": True, "busted": True}
                 final = await _finalise(rnd, tg_id, 0.0, "settled", outcome)
                 return {"outcome_step": {"player": player, "busted": True}, "multiplier": 0.0,
-                        "can_cashout": False, "busted": True, "done": True, **final}
+                        "can_cashout": False, "busted": True, "done": True,
+                        "bet": int(rnd["bet"]), **final}
             new_state = {"player": player, "dealer": dealer, "next_cursor": cursor,
                          "doubled": doubled, "player_done": False}
             if not await _persist_step(rnd, new_state):
@@ -1453,14 +1471,16 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
             return {"outcome_step": {"player": player}, "multiplier": 0.0,
                     "can_cashout": False, "busted": False, "done": False}
 
-        # stand
+        # stand — also the recovery path for a committed-but-unsettled double,
+        # so the settle response declares the round's final stake (`bet`).
         dealer, cursor = blackjack.play_dealer(draw, dealer, cursor)
         mult = blackjack.outcome_multiplier(player, dealer)
         outcome = {"player": player, "dealer": dealer, "next_cursor": cursor,
                    "doubled": doubled, "player_done": True}
         final = await _finalise(rnd, tg_id, mult, "settled", outcome)
         return {"outcome_step": {"player": player, "dealer": dealer}, "multiplier": mult,
-                "can_cashout": False, "busted": False, "done": True, **final}
+                "can_cashout": False, "busted": False, "done": True,
+                "bet": int(rnd["bet"]), **final}
 
     if name == "rps":
         # The client sends {"hand": "rock"|"paper"|"scissors"}; accept a bare
