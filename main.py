@@ -764,11 +764,15 @@ def _initial_state(name: str, np: dict, ss: str, cs: str, nonce: int) -> dict:
     if name == "chicken":
         return {"lane": 0, "difficulty": np["difficulty"]}
     if name == "crash":
-        # The whole round is fixed by the bet-time draw. Store the crash point
-        # server-side for auditability; it is NEVER returned to the client
-        # while the round is open (the /bet response carries only the hash,
-        # and no endpoint exposes an open round's outcome).
-        return {"crash_point": crash.crash_point(ss, cs, nonce)}
+        # The crash point is fixed by the bet-time draw and the round clock is
+        # anchored HERE: t0_ms is the server bet timestamp, and the round
+        # autonomously crashes once e^(GROWTH * elapsed) reaches the crash
+        # point (enforced by /cashout and the /crash/check poll). The crash
+        # point is stored server-side for auditability; it is NEVER returned
+        # to the client while the round is open (the /bet response carries
+        # only the hash, and no endpoint exposes an open round's outcome).
+        return {"crash_point": crash.crash_point(ss, cs, nonce),
+                "t0_ms": int(time.time() * 1000)}
     return {}
 
 
@@ -1433,12 +1437,15 @@ async def game_cashout(name: str, user: dict = Depends(require_user), body: dict
         mult = min(chicken.multiplier(lane, difficulty), chicken.CHICKEN_MAX_MULT)
         outcome = {"lane": lane, "difficulty": difficulty, "multiplier": mult}
     elif name == "crash":
-        # Solo crash: the crash point was fixed by the bet-time draw; the client
-        # claims the multiplier it cashed out at. m >= cp means the crash already
-        # happened → bust. No server-side timing: EV = m * P(cp > m) = 1 - EPS
-        # for ANY claimed m (see api/game/crash.py), so a client sending an
-        # instant high m gains nothing. cp is recomputed from the seed (the
-        # stored copy is audit-only); the cap makes m == CRASH_CAP always bust.
+        # Solo crash, server-clocked: the crash point AND the round clock (t0)
+        # were fixed at bet time. The round has already crashed once the
+        # server-clock multiplier reaches cp — a claim arriving after that
+        # instant busts no matter what it says. A live claim wins at
+        # min(claim, server multiplier): the clamp means a client claiming
+        # AHEAD of the clock (e.g. an instant 24.9x) just gets the clock's
+        # value, so timing fraud is impossible. cp is recomputed from the seed
+        # (the stored copy is audit-only); cp is clamped to CRASH_CAP so the
+        # curve always crashes at or below the economy ceiling.
         try:
             m = float(body.get("mult_at_cashout", 0))
         except (TypeError, ValueError):
@@ -1446,11 +1453,13 @@ async def game_cashout(name: str, user: dict = Depends(require_user), body: dict
         if not math.isfinite(m) or m < 1.0:
             return _err("invalid_move")
         cp = crash.crash_point(ss, cs, nonce)
-        if m >= cp:
+        elapsed_ms = time.time() * 1000 - float(state.get("t0_ms") or 0)
+        m_server = crash.mult_at(elapsed_ms)
+        if m >= cp or m_server >= cp:
             outcome = {"crash_point": cp, "mult_at_cashout": m,
                        "busted": True, "multiplier": 0.0}
             return await _finalise(rnd, tg_id, 0.0, "settled", outcome)
-        mult = min(m, crash.CRASH_CAP)
+        mult = min(m, m_server, crash.CRASH_CAP)
         outcome = {"crash_point": cp, "multiplier": mult}
     else:  # highlow
         step_n = int(state.get("step", 0))
@@ -1462,3 +1471,39 @@ async def game_cashout(name: str, user: dict = Depends(require_user), body: dict
         outcome = {"step": step_n, "rank": int(state.get("rank", 0)), "multiplier": mult}
 
     return await _finalise(rnd, tg_id, mult, "cashed_out", outcome)
+
+
+@app.post("/bt/api/game/crash/check")
+async def crash_check(user: dict = Depends(require_user), body: dict | None = Body(default=None)):
+    """Liveness poll for an open crash round — how the client learns of a crash.
+
+    The round autonomously crashes the instant the server-clock multiplier
+    reaches the (secret) crash point. The client polls this while its curve is
+    rising: once crashed, the round is settled here at payout 0 with the crash
+    point revealed (the same settle a too-late /cashout would produce), so the
+    UI can drop the curve at the true crash moment instead of only discovering
+    it on a failed cashout. While alive it returns ONLY the server-clock
+    multiplier — a value the client already computes itself — never anything
+    derived from the crash point (no time-remaining, no hints)."""
+    tg_id = user["tg_id"]
+    # Separate, looser bucket than game actions: the client polls ~1/s for the
+    # life of the curve (up to ~54s to the cap), which would exhaust the shared
+    # 60/min game bucket and starve the cashout itself.
+    allowed, retry_after = ratelimit.check(f"crashchk:{tg_id}", limit=180, window_sec=60)
+    if not allowed:
+        return _rl_err(retry_after)
+    body = body or {}
+    rnd, err = await _load_open_round("crash", tg_id, body.get("round_id"))
+    if err:
+        return err
+    state = rnd.get("outcome") or {}
+    ss, cs, nonce = rnd["server_seed"], rnd["client_seed"], int(rnd["nonce"])
+    cp = crash.crash_point(ss, cs, nonce)
+    elapsed_ms = time.time() * 1000 - float(state.get("t0_ms") or 0)
+    m_server = crash.mult_at(elapsed_ms)
+    if m_server >= cp:
+        outcome = {"crash_point": cp, "busted": True, "multiplier": 0.0}
+        final = await _finalise(rnd, tg_id, 0.0, "settled", outcome)
+        return {"crashed": True, "multiplier": 0.0, **final}
+    return {"ok": True, "crashed": False,
+            "multiplier": min(m_server, crash.CRASH_CAP)}
