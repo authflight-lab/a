@@ -24,8 +24,8 @@ from .seed import rng_int
 FLOORS = 8
 
 # Uniform damp on the whole multiplier ladder (operator decision: towers pays
-# 15% below the flat-EPS identity). The RTP test asserts MULT_SCALE * (1 - EPS).
-MULT_SCALE = 0.85
+# 5% below the flat-EPS identity). The RTP test asserts MULT_SCALE * (1 - EPS).
+MULT_SCALE = 0.95
 
 DIFFICULTIES = {
     "easy": {"C": 4, "t": 1},

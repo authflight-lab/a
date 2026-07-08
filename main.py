@@ -874,26 +874,12 @@ async def _open_bet(name: str, user: dict, body: dict | None):
     if not ok:
         return None, None, _err("invalid_params")
 
-    # One open round per (user, game). Rather than reject a new bet when a
-    # leftover round is still open (a crashed/abandoned client, a lost settle),
-    # auto-purge it and refund its bet, then continue opening the fresh round —
-    # "open_round_exists" must never surface to the user. Done BEFORE the balance
-    # read below so the refunded points count toward affording the new bet.
-    existing = await db.get_open_round(tg_id, name)
-    if existing:
-        await _void_open_round(existing, tg_id)
-
-    u = await db.get_user(tg_id)
-    if u is None:
-        u = await db.upsert_user(tg_id, user.get("username"), user.get("display_name")) or {}
-    balance = int(u.get("balance", 0))
-    # Distinguish a genuinely invalid stake (below the min or above the table
-    # cap) from simply not having enough points, so the client can show a
-    # "balance too low" message instead of a generic invalid-bet error.
+    # Static stake validation needs no DB: distinguish a genuinely invalid
+    # stake (below the min or above the table cap) from simply not having
+    # enough points — the balance check itself is server-side in bt_open_round
+    # (raises insufficient_balance), so no pre-read here on the hot path.
     if bet < BET_MIN or bet > BET_MAX:
         return None, None, {"ok": False, "error": "invalid_bet"}
-    if bet > balance:
-        return None, None, {"ok": False, "error": "insufficient_balance"}
 
     # Reuse the user's active seed pair (Rainbet-style): the server & client
     # seeds persist across bets and only the per-pair nonce advances. The active
@@ -901,6 +887,11 @@ async def _open_bet(name: str, user: dict, body: dict | None):
     # be predicted; it is revealed solely on rotation (see /bt/api/game/seeds/rotate).
     pair = await db.get_seed_pair(tg_id)
     if not pair:
+        # First bet ever: the seed pair FK requires a bt_users row, and a
+        # brand-new user may not have one yet (this used to be covered by a
+        # get_user/upsert_user pre-read on EVERY bet — now it only costs a
+        # round-trip on this one-time path).
+        await db.upsert_user(tg_id, user.get("username"), user.get("display_name"))
         pair = await db.create_seed_pair(tg_id, seedpair.new_pair())
 
     # Reserve the nonce and open the round atomically (single locked RPC), so two
@@ -921,12 +912,22 @@ async def _open_bet(name: str, user: dict, body: dict | None):
             result = await db.open_round(tg_id, name, bet, nonce, np, state)
             break
         except InsufficientBalance:
+            # A leftover open round (crashed/abandoned client, lost settle) may
+            # be holding the very points needed to afford this bet — the RPC
+            # debits BEFORE it would hit the one-open-round constraint, so the
+            # leftover case can surface here as insufficient_balance. Void +
+            # refund the straggler and retry; only report insufficient_balance
+            # when there is genuinely no leftover to reclaim.
+            leftover = await db.get_open_round(tg_id, name)
+            if leftover:
+                await _void_open_round(leftover, tg_id)
+                continue
             return None, None, {"ok": False, "error": "insufficient_balance"}
         except db.OpenRoundExists:
-            # A round was opened concurrently (or the pre-check above raced) after
-            # we purged. Void + refund the straggler and retry within the loop so
-            # the user never sees open_round_exists; falls through to try_again
-            # only if we exhaust the retries.
+            # A leftover round for this game is still open (or a concurrent bet
+            # raced us). Void + refund the straggler and retry within the loop
+            # so the user never sees open_round_exists; falls through to
+            # try_again only if we exhaust the retries.
             leftover = await db.get_open_round(tg_id, name)
             if leftover:
                 await _void_open_round(leftover, tg_id)

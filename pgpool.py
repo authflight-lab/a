@@ -3,8 +3,9 @@
 This is the low-latency path that bypasses the PostgREST HTTP hop for hot reads.
 It runs ALONGSIDE the httpx REST client in ``db.py`` — REST stays the default and
 authority; the pool is opt-in per call site (currently only the ``_pgprobe`` spike
-endpoint). We connect via the SESSION pooler (port 5432, IPv4) with statement
-caching disabled, which is the Supavisor-safe setting for a long-lived pool.
+endpoint). We connect via the SESSION pooler (port 5432, IPv4); prepared-statement
+caching is enabled there (each pooled connection is pinned to one backend) and
+disabled automatically if the DSN points at the transaction pooler (:6543).
 
 Importing this module performs NO network I/O: the pool is created lazily on first
 use and closed on app shutdown.
@@ -43,11 +44,19 @@ async def get_pool() -> asyncpg.Pool:
         dsn = settings.bt_supabase_db_url
         if not dsn:
             raise PgPoolNotConfigured("bt_supabase_db_url is empty")
+        # Prepared-statement caching: safe on the SESSION pooler (:5432 — each
+        # pool connection is pinned to one backend for its lifetime, so cached
+        # statements stay valid) and it saves a parse round-trip per query. The
+        # TRANSACTION pooler (:6543) multiplexes backends between transactions,
+        # which invalidates cached statements ("prepared statement does not
+        # exist"), so only there is the cache disabled. If those errors ever
+        # appear on :5432, revert to statement_cache_size=0 unconditionally.
+        stmt_cache = 0 if ":6543" in dsn else 100
         _pool = await asyncpg.create_pool(
             dsn=dsn,
-            min_size=1,
+            min_size=5,   # warm connections for bet bursts (no connect latency)
             max_size=10,
-            statement_cache_size=0,  # Supavisor-safe (avoids stale prepared stmts)
+            statement_cache_size=stmt_cache,
             command_timeout=10,
             init=_init_conn,
         )
