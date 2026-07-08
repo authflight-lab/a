@@ -28,7 +28,7 @@ from .auth import require_user
 from .config import settings
 from .db import InsufficientBalance, SupabaseNotConfigured
 from .game import BET_MAX, BET_MIN, GAMES, MULT_CAP, MULTI_STEP, P_MAX, SINGLE_SETTLE
-from .game import chicken, dice, flip, highlow, mines, plinko, rps, seedpair, towers
+from .game import chicken, crash, dice, flip, highlow, mines, plinko, rps, seedpair, towers
 from .game.seed import rng_float
 
 app = FastAPI(title="Bartender API", version="1.0")
@@ -67,7 +67,8 @@ async def _cashout_stale_round(rnd: dict) -> None:
 
     try:
         if name not in MULTI_STEP:
-            # Single-settle games (dice/plinko) that somehow stayed open: abandon.
+            # Single-settle games (dice/plinko) that somehow stayed open, and
+            # crash rounds never cashed out (the curve crashed unclaimed): abandon.
             await db.close_round(rnd["id"], {
                 "outcome": state, "payout": 0, "status": "abandoned",
                 "settled_at": db._now(),
@@ -738,6 +739,8 @@ def _validate_params(name: str, params: dict) -> tuple[bool, dict]:
     if name == "chicken":
         difficulty = str(p.get("difficulty", ""))
         return (chicken.valid_difficulty(difficulty), {"difficulty": difficulty})
+    if name == "crash":
+        return (True, {})
     if name == "plinko":
         rows = int(p.get("rows", 0))
         risk = str(p.get("risk", ""))
@@ -760,6 +763,12 @@ def _initial_state(name: str, np: dict, ss: str, cs: str, nonce: int) -> dict:
         return {"step": 0, "wins": 0, "multiplier": 1.0}
     if name == "chicken":
         return {"lane": 0, "difficulty": np["difficulty"]}
+    if name == "crash":
+        # The whole round is fixed by the bet-time draw. Store the crash point
+        # server-side for auditability; it is NEVER returned to the client
+        # while the round is open (the /bet response carries only the hash,
+        # and no endpoint exposes an open round's outcome).
+        return {"crash_point": crash.crash_point(ss, cs, nonce)}
     return {}
 
 
@@ -1366,7 +1375,9 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
 
 @app.post("/bt/api/game/{name}/cashout")
 async def game_cashout(name: str, user: dict = Depends(require_user), body: dict | None = Body(default=None)):
-    if name not in MULTI_STEP:
+    # Crash has no /step — /cashout is its ONLY in-round action, so it is
+    # allowed here alongside the multi-step games.
+    if name not in MULTI_STEP and name != "crash":
         return _err("invalid_action")
     tg_id = user["tg_id"]
     allowed, retry_after = ratelimit.check(f"game:{tg_id}", limit=60, window_sec=60)
@@ -1421,6 +1432,26 @@ async def game_cashout(name: str, user: dict = Depends(require_user), body: dict
             return _err("must_cross_first")
         mult = min(chicken.multiplier(lane, difficulty), chicken.CHICKEN_MAX_MULT)
         outcome = {"lane": lane, "difficulty": difficulty, "multiplier": mult}
+    elif name == "crash":
+        # Solo crash: the crash point was fixed by the bet-time draw; the client
+        # claims the multiplier it cashed out at. m >= cp means the crash already
+        # happened → bust. No server-side timing: EV = m * P(cp > m) = 1 - EPS
+        # for ANY claimed m (see api/game/crash.py), so a client sending an
+        # instant high m gains nothing. cp is recomputed from the seed (the
+        # stored copy is audit-only); the cap makes m == CRASH_CAP always bust.
+        try:
+            m = float(body.get("mult_at_cashout", 0))
+        except (TypeError, ValueError):
+            return _err("invalid_move")
+        if not math.isfinite(m) or m < 1.0:
+            return _err("invalid_move")
+        cp = crash.crash_point(ss, cs, nonce)
+        if m >= cp:
+            outcome = {"crash_point": cp, "mult_at_cashout": m,
+                       "busted": True, "multiplier": 0.0}
+            return await _finalise(rnd, tg_id, 0.0, "settled", outcome)
+        mult = min(m, crash.CRASH_CAP)
+        outcome = {"crash_point": cp, "multiplier": mult}
     else:  # highlow
         step_n = int(state.get("step", 0))
         # Must make at least one real pick before cashing out (skips don't count),

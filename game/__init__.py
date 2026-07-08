@@ -23,4 +23,6 @@ BET_MAX = 350
 
 SINGLE_SETTLE = ("dice", "plinko")
 MULTI_STEP = ("flip", "mines", "towers", "highlow", "rps", "chicken")
-GAMES = ("dice", "flip", "mines", "towers", "highlow", "plinko", "rps", "chicken")
+# Crash is neither: no /settle (outcome isn't returned at open) and no /step —
+# its only interaction is /cashout, special-cased in main.game_cashout.
+GAMES = ("dice", "flip", "mines", "towers", "highlow", "plinko", "rps", "chicken", "crash")

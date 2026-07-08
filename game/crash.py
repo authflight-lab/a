@@ -34,14 +34,18 @@ def crash_point(server_seed: str, client_seed: str, nonce: int) -> float:
     return min(max(1.0, (1.0 - EPS) / u), CRASH_CAP)
 
 
-def simulate_ev(n: int, server_seed: str = "s" * 64, client_seed: str = "c" * 64) -> float:
-    """Monte-Carlo E[min(cp, CRASH_CAP)] over n seeded draws (RTP test helper).
+def sample_crash_points(n: int, server_seed: str = "s" * 64,
+                        client_seed: str = "c" * 64) -> list[float]:
+    """n seeded crash-point draws (nonce = 0..n-1) for Monte-Carlo RTP checks."""
+    return [crash_point(server_seed, client_seed, i) for i in range(n)]
 
-    A player who could cash out at the last instant before the crash would
-    collect exactly min(cp, CRASH_CAP); its expectation is the game's RTP
-    ceiling and must come out ~= 1 - EPS.
+
+def simulate_ev(cps: list[float], target: float) -> float:
+    """Monte-Carlo EV of the strategy "cash out at ``target``" over a sample.
+
+    Payoff per round is ``target`` if the crash point exceeds it, else 0, so
+    the empirical mean must land on 1 - EPS for ANY fixed target in
+    (1, CRASH_CAP). (Note E[cp] itself is NOT the RTP — cashing out exactly at
+    the crash point busts; only strictly below it wins.)
     """
-    total = 0.0
-    for i in range(n):
-        total += crash_point(server_seed, client_seed, i)
-    return total / n
+    return sum(target for cp in cps if cp > target) / len(cps)

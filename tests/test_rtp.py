@@ -13,7 +13,7 @@ decision: P(reaching the state) * M(state) + P(busting) * 0 == target.
 
 import math
 
-from api.game import EPS, chicken, dice, flip, highlow, mines, plinko, rps, towers
+from api.game import EPS, chicken, crash, dice, flip, highlow, mines, plinko, rps, towers
 
 TARGET = 1 - EPS
 TOL = 1e-9
@@ -110,6 +110,24 @@ def test_chicken_car_zones():
             cars = chicken.car_zones(ss, cs, 0, lane, difficulty)
             assert len(cars) == d["T"] == len(set(cars))
             assert all(0 <= z < d["C"] for z in cars)
+
+
+def test_crash_rtp():
+    # Crash's outcome is continuous, so the identity is checked by Monte Carlo:
+    # for a fixed cashout target m the payoff is m·1{cp > m}, whose expectation
+    # is exactly (1 - EPS) for any m in (1, CRASH_CAP). The 100k HMAC draws are
+    # deterministic (fixed seeds), so this is a stable check, not a flaky one.
+    cps = crash.sample_crash_points(400_000)
+    for target in (1.5, 2.0, 5.0):
+        ev = crash.simulate_ev(cps, target)
+        assert abs(ev - TARGET) < 0.005, f"target={target} ev={ev}"
+
+    # Formula bounds: cp is clamped to [1.0, CRASH_CAP] for every draw, and the
+    # cap matches the global economy ceiling.
+    assert crash.CRASH_CAP == 25.0
+    for i in range(200):
+        cp = crash.crash_point("s" * 64, "c" * 64, i)
+        assert 1.0 <= cp <= crash.CRASH_CAP
 
 
 def test_plinko_rtp():
