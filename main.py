@@ -267,8 +267,10 @@ def _daily_claim(streak: int) -> int:
 
 
 def _payout(bet: int, multiplier: float) -> int:
-    """bet * multiplier, floored, capped at P_MAX (spec §6)."""
-    return min(int(bet * multiplier), P_MAX)
+    """bet * multiplier, rounded to the nearest integer (half rounds up so a
+    payout of exactly x.50 always rounds up, not Python's banker's rounding),
+    capped at P_MAX (spec §6)."""
+    return min(math.floor(bet * multiplier + 0.5), P_MAX)
 
 
 def _err(code: str, status: int = 400) -> JSONResponse:
