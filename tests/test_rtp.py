@@ -13,7 +13,7 @@ decision: P(reaching the state) * M(state) + P(busting) * 0 == target.
 
 import math
 
-from api.game import EPS, chicken, crash, dice, flip, highlow, mines, plinko, rps, towers
+from api.game import EPS, blackjack, chicken, crash, dice, flip, highlow, mines, plinko, rps, towers
 
 TARGET = 1 - EPS
 TOL = 1e-9
@@ -144,3 +144,46 @@ def test_plinko_rtp():
     for n in plinko.ROWS:
         for risk in plinko.RISK:
             assert abs(_rtp(plinko.rtp_distribution(n, risk)) - TARGET) < TOL
+
+
+def test_blackjack_rtp():
+    # Blackjack pays REAL fixed table odds (2x/2.5x/1x/0x), not an EPS-scaled
+    # multiplier, so there's no single closed-form target to assert exact
+    # equality against (unlike every other game here). Instead: simulate a
+    # simple mimic-the-dealer player strategy and assert the resulting RTP
+    # lands in blackjack's well-known real-world band (~99.5% with basic
+    # strategy, lower with a naive one) — a sanity check on the payout table
+    # and natural/bust/push logic, not a fairness proof.
+    dist = blackjack.rtp_distribution(200_000)
+    rtp = _rtp(dist)
+    assert 0.85 < rtp < 1.02, f"blackjack rtp out of band: {rtp}"
+    # Every outcome must be one of the four real fixed multipliers.
+    assert all(m in (0.0, 1.0, 2.0, 2.5) for _, m in dist)
+
+
+def test_blackjack_hand_logic():
+    # Ace reduction: A + 6 is a soft 17 (counts as 11+6), not a bust.
+    total, soft = blackjack.hand_total([1, 6])
+    assert total == 17 and soft
+    # A + K is a natural 21 (2 cards) — is_blackjack only fires on exactly 2.
+    assert blackjack.is_blackjack([1, 13])
+    assert not blackjack.is_blackjack([7, 7, 7])  # 21 via 3 cards is NOT a natural
+    # Two aces reduce to 12, not bust.
+    total, soft = blackjack.hand_total([1, 1])
+    assert total == 12 and soft
+    # Bust detection and dealer S17 (stands on soft 17 too).
+    assert blackjack.is_bust(22)
+    assert not blackjack.is_bust(21)
+    assert not blackjack.dealer_should_hit([1, 6])  # soft 17 -> stand (S17)
+    assert blackjack.dealer_should_hit([10, 6])     # hard 16 -> hit
+    # outcome_multiplier: dealer bust pays 2x even if player is low but not bust.
+    assert blackjack.outcome_multiplier([10, 5], [10, 6, 10]) == 2.0
+    # push (equal, no bust) pays 1x.
+    assert blackjack.outcome_multiplier([10, 9], [10, 9]) == 1.0
+    # player bust always loses regardless of dealer hand.
+    assert blackjack.outcome_multiplier([10, 9, 5], [2, 2]) == 0.0
+    # natural_outcome: player natural vs non-natural dealer pays 2.5x; both
+    # natural is a push; no player natural returns None (round continues).
+    assert blackjack.natural_outcome([1, 13], [10, 9]) == 2.5
+    assert blackjack.natural_outcome([1, 13], [1, 12]) == 1.0
+    assert blackjack.natural_outcome([10, 9], [1, 12]) is None

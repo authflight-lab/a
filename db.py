@@ -830,6 +830,64 @@ async def _settle_round_rest(round_id: str, tg_id: int, outcome: dict, payout: i
     return r.json()
 
 
+async def _double_round_rest(round_id: str, tg_id: int, extra_bet: int, outcome: dict) -> dict | None:
+    client = _get_client()
+    payload = {
+        "p_round_id": round_id,
+        "p_tg_id": tg_id,
+        "p_extra_bet": extra_bet,
+        "p_outcome": outcome,
+    }
+    r = await client.post("/rpc/bt_double_round", json=payload)
+    if r.status_code >= 400:
+        body = ""
+        try:
+            body = r.text
+        except Exception:
+            pass
+        if "round_not_open" in body:
+            return None
+        if "insufficient_balance" in body:
+            raise InsufficientBalance("insufficient_balance")
+        raise SupabaseError(f"double_round failed: {r.status_code} {body}")
+    _invalidate_user(tg_id)
+    return r.json()
+
+
+async def double_round(round_id: str, tg_id: int, extra_bet: int, outcome: dict) -> dict | None:
+    """Blackjack double-down: debit ``extra_bet`` and add it onto the round's
+    bet + write the new outcome, atomically, via the ``bt_double_round`` RPC.
+
+    Returns ``{"balance": int, "bet": int}``, or ``None`` if the round is no
+    longer open (settled/expired underneath the caller).
+
+    Raises ``InsufficientBalance`` if the extra stake can't be covered.
+    """
+    try:
+        pool = await pgpool.get_pool()
+    except Exception as e:  # noqa: BLE001 — pool unavailable → REST
+        if pgpool.should_fallback(e):
+            return await _double_round_rest(round_id, tg_id, extra_bet, outcome)
+        raise
+    try:
+        val = await pool.fetchval(
+            "select bt_double_round($1::uuid, $2, $3, $4)",
+            str(round_id), tg_id, extra_bet, outcome)
+    except asyncpg.exceptions.RaiseError as re:
+        msg = getattr(re, "message", "") or str(re)
+        if "round_not_open" in msg:
+            return None
+        if "insufficient_balance" in msg:
+            raise InsufficientBalance("insufficient_balance")
+        raise SupabaseError(f"double_round failed: {msg}")
+    except Exception as e:  # noqa: BLE001 — transport failure → REST
+        if pgpool.should_fallback(e):
+            return await _double_round_rest(round_id, tg_id, extra_bet, outcome)
+        raise
+    _invalidate_user(tg_id)
+    return val
+
+
 async def claim_daily(tg_id: int, day_start_iso: str, streak: int, now_iso: str) -> dict | None:
     """Compare-and-swap the daily claim: set ``streak_days``/``last_claim_at``
     only if ``last_claim_at`` predates today's UTC start (or is null).

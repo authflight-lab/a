@@ -28,7 +28,7 @@ from .auth import require_user
 from .config import settings
 from .db import InsufficientBalance, SupabaseNotConfigured
 from .game import BET_MAX, BET_MIN, GAMES, MULT_CAP, MULTI_STEP, P_MAX, SINGLE_SETTLE
-from .game import chicken, crash, dice, flip, highlow, mines, plinko, rps, seedpair, towers
+from .game import blackjack, chicken, crash, dice, flip, highlow, mines, plinko, rps, seedpair, towers
 from .game.seed import rng_float
 
 app = FastAPI(title="Bartender API", version="1.0")
@@ -805,6 +805,8 @@ def _validate_params(name: str, params: dict) -> tuple[bool, dict]:
         rows = int(p.get("rows", 0))
         risk = str(p.get("risk", ""))
         return (plinko.valid_rows(rows) and plinko.valid_risk(risk), {"rows": rows, "risk": risk})
+    if name == "blackjack":
+        return (True, {})
     return (False, {})
 
 
@@ -833,6 +835,8 @@ def _initial_state(name: str, np: dict, ss: str, cs: str, nonce: int) -> dict:
         # only the hash, and no endpoint exposes an open round's outcome).
         return {"crash_point": crash.crash_point(ss, cs, nonce),
                 "t0_ms": int(time.time() * 1000)}
+    if name == "blackjack":
+        return blackjack.deal_initial(lambda i: rng_float(ss, cs, nonce, i))
     return {}
 
 
@@ -1000,13 +1004,41 @@ async def _open_bet(name: str, user: dict, body: dict | None):
         "balance": result.get("balance"),
         "params": resp_params,
     }
+    if name == "blackjack":
+        # Only the player's full hand and the dealer's UP card are ever shown
+        # at deal time — the dealer's hole card stays hidden until the round
+        # ends (stand/bust/double), exactly like a real table.
+        resp["player"] = state["player"]
+        resp["dealer_up"] = state["dealer"][0]
     return rnd, resp, None
 
 
 @app.post("/bt/api/game/{name}/bet")
 async def game_bet(name: str, user: dict = Depends(require_user), body: dict | None = Body(default=None)):
-    _rnd, resp, err = await _open_bet(name, user, body)
-    return err or resp
+    rnd, resp, err = await _open_bet(name, user, body)
+    if err:
+        return err
+    if name == "blackjack":
+        # A player natural (2-card 21) settles immediately at deal time, per
+        # real-table rules — there's no hit/stand/double offered on a natural.
+        tg_id = user["tg_id"]
+        state = rnd["outcome"]
+        player, dealer = state["player"], state["dealer"]
+        nat = blackjack.natural_outcome(player, dealer)
+        if nat is not None:
+            outcome = {**state, "natural": True}
+            final = await _finalise(rnd, tg_id, nat, "settled", outcome)
+            if final.get("ok") is False:
+                return final
+            resp["dealer"] = dealer
+            resp["multiplier"] = nat
+            resp["done"] = True
+            resp["outcome"] = final["outcome"]
+            resp["payout"] = final["payout"]
+            resp["new_balance"] = final["new_balance"]
+            return resp
+        resp["done"] = False
+    return resp
 
 
 # In-process cache of OPEN rounds, keyed by round_id. It lets a mid-game step
@@ -1188,7 +1220,7 @@ async def game_play(name: str, user: dict = Depends(require_user), body: dict | 
 
 @app.post("/bt/api/game/{name}/step")
 async def game_step(name: str, user: dict = Depends(require_user), body: dict | None = Body(default=None)):
-    if name not in MULTI_STEP:
+    if name not in MULTI_STEP and name != "blackjack":
         return _err("invalid_action")
     tg_id = user["tg_id"]
     allowed, retry_after = ratelimit.check(f"game:{tg_id}", limit=settings.bt_rl_game_limit, window_sec=settings.bt_rl_game_window_sec)
@@ -1339,6 +1371,74 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
         return {"outcome_step": {"lane": lane, "zone": zone, "safe": True}, "multiplier": mult,
                 "can_cashout": True, "busted": False, "done": False}
 
+    if name == "blackjack":
+        action = move.get("action") if isinstance(move, dict) else move
+        if action not in ("hit", "stand", "double"):
+            return _err("invalid_move")
+        player = list(state.get("player") or [])
+        dealer = list(state.get("dealer") or [])
+        cursor = int(state.get("next_cursor", 4))
+        doubled = bool(state.get("doubled", False))
+        draw = lambda i: rng_float(ss, cs, nonce, i)
+
+        if action == "double":
+            # Only allowed as the very first decision (2-card hand, no hits
+            # yet, not already doubled) — matches the task's no-splitting,
+            # single-double-per-hand v1 scope.
+            if len(player) != 2 or doubled:
+                return _err("invalid_move")
+            try:
+                bal = await db.double_round(rnd["id"], tg_id, int(rnd["bet"]), state)
+            except InsufficientBalance:
+                return _err("insufficient_balance")
+            if bal is None:
+                return _err("round_not_open")
+            rnd["bet"] = int(bal["bet"])
+            player.append(blackjack.draw_card(draw, cursor))
+            cursor += 1
+            p_total, _ = blackjack.hand_total(player)
+            if blackjack.is_bust(p_total):
+                outcome = {"player": player, "dealer": dealer, "next_cursor": cursor,
+                           "doubled": True, "player_done": True, "busted": True}
+                final = await _finalise(rnd, tg_id, 0.0, "settled", outcome)
+                return {"outcome_step": {"player": player, "busted": True}, "multiplier": 0.0,
+                        "can_cashout": False, "busted": True, "done": True,
+                        "balance": bal["balance"], **final}
+            dealer, cursor = blackjack.play_dealer(draw, dealer, cursor)
+            mult = blackjack.outcome_multiplier(player, dealer)
+            outcome = {"player": player, "dealer": dealer, "next_cursor": cursor,
+                       "doubled": True, "player_done": True}
+            final = await _finalise(rnd, tg_id, mult, "settled", outcome)
+            return {"outcome_step": {"player": player, "dealer": dealer}, "multiplier": mult,
+                    "can_cashout": False, "busted": False, "done": True,
+                    "balance": bal["balance"], **final}
+
+        if action == "hit":
+            player.append(blackjack.draw_card(draw, cursor))
+            cursor += 1
+            p_total, _ = blackjack.hand_total(player)
+            if blackjack.is_bust(p_total):
+                outcome = {"player": player, "dealer": dealer, "next_cursor": cursor,
+                           "doubled": doubled, "player_done": True, "busted": True}
+                final = await _finalise(rnd, tg_id, 0.0, "settled", outcome)
+                return {"outcome_step": {"player": player, "busted": True}, "multiplier": 0.0,
+                        "can_cashout": False, "busted": True, "done": True, **final}
+            new_state = {"player": player, "dealer": dealer, "next_cursor": cursor,
+                         "doubled": doubled, "player_done": False}
+            if not await _persist_step(rnd, new_state):
+                return _err("round_not_open")
+            return {"outcome_step": {"player": player}, "multiplier": 0.0,
+                    "can_cashout": False, "busted": False, "done": False}
+
+        # stand
+        dealer, cursor = blackjack.play_dealer(draw, dealer, cursor)
+        mult = blackjack.outcome_multiplier(player, dealer)
+        outcome = {"player": player, "dealer": dealer, "next_cursor": cursor,
+                   "doubled": doubled, "player_done": True}
+        final = await _finalise(rnd, tg_id, mult, "settled", outcome)
+        return {"outcome_step": {"player": player, "dealer": dealer}, "multiplier": mult,
+                "can_cashout": False, "busted": False, "done": True, **final}
+
     if name == "rps":
         # The client sends {"hand": "rock"|"paper"|"scissors"}; accept a bare
         # string too for robustness. One draw per round, cursor = round index
@@ -1441,7 +1541,9 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
 @app.post("/bt/api/game/{name}/cashout")
 async def game_cashout(name: str, user: dict = Depends(require_user), body: dict | None = Body(default=None)):
     # Crash has no /step — /cashout is its ONLY in-round action, so it is
-    # allowed here alongside the multi-step games.
+    # allowed here alongside the multi-step games. Blackjack is the opposite:
+    # it has /step but NO /cashout — a hand is always played to a stand/bust/
+    # double (there's no partial-progress multiplier to bank early).
     if name not in MULTI_STEP and name != "crash":
         return _err("invalid_action")
     tg_id = user["tg_id"]

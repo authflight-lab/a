@@ -23,6 +23,9 @@ BET_MAX = 350
 
 SINGLE_SETTLE = ("dice", "plinko")
 MULTI_STEP = ("flip", "mines", "towers", "highlow", "rps", "chicken")
-# Crash is neither: no /settle (outcome isn't returned at open) and no /step —
-# its only interaction is /cashout, special-cased in main.game_cashout.
-GAMES = ("dice", "flip", "mines", "towers", "highlow", "plinko", "rps", "chicken", "crash")
+# Blackjack is neither SINGLE_SETTLE nor MULTI_STEP: it deals at /bet (settling
+# immediately on a player natural), takes /step moves (hit/stand/double), and
+# has NO /cashout (there's no partial-progress multiplier to bank early — a
+# hand is always played to a stand/bust/double, so /cashout is rejected for it
+# exactly like crash rejects /step). Special-cased throughout main.py.
+GAMES = ("dice", "flip", "mines", "towers", "highlow", "plinko", "rps", "chicken", "crash", "blackjack")
