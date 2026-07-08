@@ -28,7 +28,7 @@ from .auth import require_user
 from .config import settings
 from .db import InsufficientBalance, SupabaseNotConfigured
 from .game import BET_MAX, BET_MIN, GAMES, MULT_CAP, MULTI_STEP, P_MAX, SINGLE_SETTLE
-from .game import dice, flip, highlow, mines, plinko, seedpair, towers
+from .game import dice, flip, highlow, mines, plinko, rps, seedpair, towers
 from .game.seed import rng_float
 
 app = FastAPI(title="Bartender API", version="1.0")
@@ -95,6 +95,15 @@ async def _cashout_stale_round(rnd: dict) -> None:
                 difficulty = str(params.get("difficulty", "medium"))
                 mult = min(towers.multiplier(floor, difficulty), MULT_CAP)
                 outcome = {"floor": floor, "difficulty": difficulty, "multiplier": mult}
+        elif name == "rps":
+            wins = int(state.get("wins", 0))
+            # Ties advance `step` but not `wins`; a round with no wins has made
+            # no winning wager, so it settles at 0 just like the cashout gate.
+            if wins < 1:
+                mult, outcome = 0.0, {"wins": 0, "multiplier": 0.0}
+            else:
+                mult = min(rps.multiplier(wins), rps.RPS_MAX_MULT)
+                outcome = {"wins": wins, "step": int(state.get("step", 0)), "multiplier": mult}
         else:  # highlow
             step_n = int(state.get("step", 0))
             # Skips advance `step` but not `picks`; a skip-only round has made no
@@ -714,6 +723,8 @@ def _validate_params(name: str, params: dict) -> tuple[bool, dict]:
         return (towers.valid_difficulty(difficulty), {"difficulty": difficulty})
     if name == "highlow":
         return (True, {})
+    if name == "rps":
+        return (True, {})
     if name == "plinko":
         rows = int(p.get("rows", 0))
         risk = str(p.get("risk", ""))
@@ -732,6 +743,8 @@ def _initial_state(name: str, np: dict, ss: str, cs: str, nonce: int) -> dict:
     if name == "highlow":
         start = highlow.current_card(lambda i: rng_float(ss, cs, nonce, i), 0)
         return {"rank": start, "start_card": start, "step": 0, "multiplier": 1.0}
+    if name == "rps":
+        return {"step": 0, "wins": 0, "multiplier": 1.0}
     return {}
 
 
@@ -1199,6 +1212,55 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
         return {"outcome_step": {"floor": floor, "col": col, "safe": True}, "multiplier": mult,
                 "can_cashout": True, "busted": False, "done": False}
 
+    if name == "rps":
+        # The client sends {"hand": "rock"|"paper"|"scissors"}; accept a bare
+        # string too for robustness. One draw per round, cursor = round index
+        # (ties consume a draw too, keeping every draw provably deterministic).
+        pick = move.get("hand") if isinstance(move, dict) else move
+        if pick not in rps.HANDS:
+            return _err("invalid_move")
+        step_n = int(state.get("step", 0))
+        wins = int(state.get("wins", 0))
+        player = rps.HANDS.index(pick)
+        house = rps.house_hand(rng_float(ss, cs, nonce, step_n))
+        house_name = rps.HANDS[house]
+        if player == house:
+            # Tie — neutral replay: chain multiplier unchanged, fresh draw next.
+            cur_mult = min(rps.multiplier(wins), rps.RPS_MAX_MULT)
+            new_state = {"step": step_n + 1, "wins": wins, "multiplier": cur_mult}
+            if not await _persist_step(rnd, new_state):
+                return _err("round_not_open")
+            return {"outcome_step": {"house": house_name, "pick": pick, "tie": True,
+                                     "win": False, "wins": wins},
+                    "multiplier": cur_mult, "tie": True, "can_cashout": wins >= 1,
+                    "busted": False, "done": False}
+        if not rps.beats(player, house):
+            outcome = {"step": step_n, "wins": wins, "house": house_name,
+                       "pick": pick, "busted": True}
+            final = await _finalise(rnd, tg_id, 0.0, "settled", outcome)
+            return {"outcome_step": {"house": house_name, "pick": pick, "tie": False,
+                                     "win": False, "wins": wins},
+                    "multiplier": 0.0, "can_cashout": False, "busted": True,
+                    "done": True, **final}
+        new_wins = wins + 1
+        raw = rps.multiplier(new_wins)
+        mult = min(raw, rps.RPS_MAX_MULT)
+        # Auto-cash once the cap is reached (the 5th straight win lands on 20x).
+        done = raw >= rps.RPS_MAX_MULT
+        new_state = {"step": step_n + 1, "wins": new_wins, "multiplier": mult}
+        if done:
+            outcome = {**new_state, "capped": True}
+            final = await _finalise(rnd, tg_id, mult, "cashed_out", outcome)
+            return {"outcome_step": {"house": house_name, "pick": pick, "tie": False,
+                                     "win": True, "wins": new_wins},
+                    "multiplier": mult, "can_cashout": True, "busted": False,
+                    "done": True, **final}
+        if not await _persist_step(rnd, new_state):
+            return _err("round_not_open")
+        return {"outcome_step": {"house": house_name, "pick": pick, "tie": False,
+                                 "win": True, "wins": new_wins},
+                "multiplier": mult, "can_cashout": True, "busted": False, "done": False}
+
     # highlow — the client sends the direction as {"guess": ...} (matching the
     # other games' dict-shaped moves); accept a bare string too for robustness.
     guess = move.get("guess") if isinstance(move, dict) else move
@@ -1290,6 +1352,14 @@ async def game_cashout(name: str, user: dict = Depends(require_user), body: dict
             return _err("must_climb_first")
         mult = min(towers.multiplier(floor, difficulty), MULT_CAP)
         outcome = {"floor": floor, "difficulty": difficulty, "multiplier": mult}
+    elif name == "rps":
+        wins = int(state.get("wins", 0))
+        # Must win at least one round before cashing out (ties don't count), so
+        # a bet can't be cashed straight back at the 1.0x baseline.
+        if wins < 1:
+            return _err("must_win_first")
+        mult = min(rps.multiplier(wins), rps.RPS_MAX_MULT)
+        outcome = {"wins": wins, "step": int(state.get("step", 0)), "multiplier": mult}
     else:  # highlow
         step_n = int(state.get("step", 0))
         # Must make at least one real pick before cashing out (skips don't count),

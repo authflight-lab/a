@@ -22,5 +22,5 @@ BET_MIN = 1
 BET_MAX = 350
 
 SINGLE_SETTLE = ("dice", "plinko")
-MULTI_STEP = ("flip", "mines", "towers", "highlow")
-GAMES = ("dice", "flip", "mines", "towers", "highlow", "plinko")
+MULTI_STEP = ("flip", "mines", "towers", "highlow", "rps")
+GAMES = ("dice", "flip", "mines", "towers", "highlow", "plinko", "rps")

@@ -13,7 +13,7 @@ decision: P(reaching the state) * M(state) + P(busting) * 0 == target.
 
 import math
 
-from api.game import EPS, dice, flip, highlow, mines, plinko, towers
+from api.game import EPS, dice, flip, highlow, mines, plinko, rps, towers
 
 TARGET = 1 - EPS
 TOL = 1e-9
@@ -59,6 +59,26 @@ def test_highlow_rtp():
             if not highlow.can_pick(direction, r):
                 continue
             assert abs(_rtp(highlow.rtp_distribution(direction, r)) - hl_target) < TOL
+
+
+def test_rps_rtp():
+    # Ties are EV-neutral replays (multiplier unchanged, fresh draw), so the
+    # identity holds per RESOLVED round: P(win)*FACTOR + P(lose)*0 == 1 - EPS.
+    assert abs(_rtp(rps.rtp_distribution()) - TARGET) < TOL
+    # The ladder: 1.96^4 = 14.76x is the last full rung; the 5th win exceeds
+    # the 20x cap (auto-cashout territory).
+    assert rps.multiplier(4) < rps.RPS_MAX_MULT < rps.multiplier(5)
+
+
+def test_rps_rules():
+    # rock(0) beats scissors(2), paper(1) beats rock(0), scissors(2) beats paper(1)
+    assert rps.beats(0, 2) and rps.beats(1, 0) and rps.beats(2, 1)
+    assert not (rps.beats(2, 0) or rps.beats(0, 1) or rps.beats(1, 2))
+    assert not any(rps.beats(h, h) for h in range(3))
+    # house_hand maps [0,1) uniformly onto 0..2 and never overflows.
+    assert rps.house_hand(0.0) == 0
+    assert rps.house_hand(0.5) == 1
+    assert rps.house_hand(0.999999999) == 2
 
 
 def test_plinko_rtp():
