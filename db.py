@@ -1001,10 +1001,12 @@ async def chat_counts_since(start_day: str) -> list[dict]:
         return hit
     try:
         pool = await pgpool.get_pool()
+        # asyncpg binds a date param from a datetime.date object, NOT an ISO
+        # string (str has no .toordinal → encode error), so parse it first.
         recs = await pool.fetch(
             "select tg_id, sum(count)::bigint as count from bt_chat_counts "
-            "where day >= $1::date group by tg_id",
-            start_day)
+            "where day >= $1 group by tg_id",
+            date.fromisoformat(start_day))
         rows = [_row(r) for r in recs]
     except Exception as e:  # noqa: BLE001
         if not pgpool.should_fallback(e):
