@@ -570,7 +570,8 @@ async def redeem(user: dict = Depends(require_user), body: dict | None = Body(de
     # Best effort — never affects the committed redemption or the response.
     try:
         log_chat = await db.get_log_chat_id()
-        if log_chat:
+        redemption_id = str(result.get("redemption_id", ""))
+        if log_chat and redemption_id:
             rw = await db.get_reward(reward_id)
             title = (rw or {}).get("title") or "reward"
             limit = int((rw or {}).get("monthly_limit", 0))
@@ -585,12 +586,14 @@ async def redeem(user: dict = Depends(require_user), body: dict | None = Body(de
             name_parts = (user.get("display_name") or "").split()
             first_name = name_parts[0] if name_parts else str(tg_id)
             link = notify.profile_link(tg_id, user.get("username"), first_name)
-            await notify.send_dm(
+            await notify.send_redemption_notification(
                 log_chat,
                 f"🎟️ <b>Redemption request</b>\n\n"
                 f"User: {link}\n"
-                f"Prize: <code>{notify.esc(title)}</code>\n"
-                f"Current Stock: {notify.esc(stock)} (-1 after claimed)",
+                f"Prize: <b>{notify.esc(title)}</b>\n"
+                f"Stock: {notify.esc(stock)} → {max(0, int(stock) - 1) if stock.isdigit() else stock}\n"
+                f"ID: <code>{notify.esc(redemption_id)}</code>",
+                redemption_id,
             )
     except Exception as e:
         logger.warning("bt_redeem_log_error", error=str(e))

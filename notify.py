@@ -41,32 +41,60 @@ def profile_link(tg_id: int, username: str | None, name: str | None) -> str:
     return f'<a href="{href}">{label}</a>'
 
 
+async def _send(tg_id: int, payload: dict) -> bool:
+    """POST a sendMessage payload. Returns True on success, never raises."""
+    token = settings.bot_token
+    if not token:
+        logger.warning("bt_dm_no_token")
+        return False
+    url = f"{_TELEGRAM_API}/bot{token}/sendMessage"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(url, json=payload)
+        if resp.status_code == 200 and resp.json().get("ok"):
+            return True
+        logger.warning("bt_dm_failed", extra={"tg_id": tg_id, "status": resp.status_code})
+        return False
+    except Exception as e:
+        logger.warning("bt_dm_error tg_id=%s error=%s", tg_id, e)
+        return False
+
+
 async def send_dm(tg_id: int, text: str) -> bool:
     """Send an HTML DM to ``tg_id``. Returns True on success, False otherwise.
 
     Never raises — swallows and logs all errors so the caller's request can
     proceed regardless of delivery outcome.
     """
-    token = settings.bot_token
-    if not token:
-        logger.warning("bt_dm_no_token")
-        return False
-    url = f"{_TELEGRAM_API}/bot{token}/sendMessage"
-    payload = {
+    return await _send(tg_id, {
         "chat_id": tg_id,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
+    })
+
+
+async def send_redemption_notification(
+    log_chat: int,
+    text: str,
+    redemption_id: str,
+) -> bool:
+    """Send a redemption alert to the log chat with Fulfil / Reject buttons.
+
+    The callback_data format ``redeem_fulfil:<uuid>`` / ``redeem_reject:<uuid>``
+    is handled by the bot's callback query handler, so admins can act without
+    ever typing or copy-pasting the UUID.
+    """
+    payload = {
+        "chat_id": log_chat,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+        "reply_markup": {
+            "inline_keyboard": [[
+                {"text": "✅ Fulfil", "callback_data": f"redeem_fulfil:{redemption_id}"},
+                {"text": "❌ Reject", "callback_data": f"redeem_reject:{redemption_id}"},
+            ]]
+        },
     }
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(url, json=payload)
-        if resp.status_code == 200 and resp.json().get("ok"):
-            return True
-        logger.warning(
-            "bt_dm_failed", extra={"tg_id": tg_id, "status": resp.status_code}
-        )
-        return False
-    except Exception as e:
-        logger.warning("bt_dm_error tg_id=%s error=%s", tg_id, e)
-        return False
+    return await _send(log_chat, payload)
