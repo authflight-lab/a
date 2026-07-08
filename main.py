@@ -1464,6 +1464,16 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
                 return {"outcome_step": {"player": player, "busted": True}, "multiplier": 0.0,
                         "can_cashout": False, "busted": True, "done": True,
                         "bet": int(rnd["bet"]), **final}
+            if p_total == 21:
+                # Auto-settle: player hit exactly 21 (wins at 2x, dealer plays out).
+                dealer, cursor = blackjack.play_dealer(draw, dealer, cursor)
+                mult = blackjack.outcome_multiplier(player, dealer)
+                outcome = {"player": player, "dealer": dealer, "next_cursor": cursor,
+                           "doubled": doubled, "player_done": True}
+                final = await _finalise(rnd, tg_id, mult, "settled", outcome)
+                return {"outcome_step": {"player": player, "dealer": dealer}, "multiplier": mult,
+                        "can_cashout": False, "busted": False, "done": True,
+                        "bet": int(rnd["bet"]), **final}
             new_state = {"player": player, "dealer": dealer, "next_cursor": cursor,
                          "doubled": doubled, "player_done": False}
             if not await _persist_step(rnd, new_state):
