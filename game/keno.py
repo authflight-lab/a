@@ -36,20 +36,25 @@ from .seed import rng_float
 
 GRID, DRAW, MAX_PICKS = 40, 10, 10
 
-# Relative payout weights per (picks k, hits h). Missing hit counts pay 0. The
-# classic profile: low hit counts pay nothing, payouts ramp hard toward the max.
-# These are shape only — the per-row factor rescales each row to the exact edge.
+# Relative payout weights per (picks k, hits h). Missing hit counts pay 0. This
+# is the Stake/Rainbet "Classic" profile: a deliberately FLAT middle (modest
+# wins at the hit counts players actually reach) that only spikes near the top
+# (10-pick tops at ~100x). It is used as SHAPE — the per-row factor rescales each
+# row to the exact edge, and since the raw curve already sits at ~0.99 RTP the
+# factor is ~0.99, so the numbers land right on the Classic table. An earlier
+# top-heavy SHAPE was mathematically fair (edge still exact) but felt unplayable:
+# it paid nothing until near-impossible hit counts, then paid lottery numbers.
 SHAPE = {
-    1:  {1: 1},
-    2:  {2: 1},
-    3:  {2: 0.5, 3: 1},
-    4:  {2: 0.3, 3: 1, 4: 3},
-    5:  {3: 1, 4: 3, 5: 10},
-    6:  {3: 0.7, 4: 2, 5: 8, 6: 30},
-    7:  {4: 1.5, 5: 5, 6: 20, 7: 80},
-    8:  {5: 3, 6: 12, 7: 50, 8: 200},
-    9:  {5: 2, 6: 6, 7: 25, 8: 100, 9: 500},
-    10: {5: 2, 6: 5, 7: 20, 8: 80, 9: 400, 10: 1000},
+    1:  {1: 3.96},
+    2:  {1: 1.9, 2: 4.5},
+    3:  {1: 1, 2: 3.1, 3: 10.4},
+    4:  {1: 0.8, 2: 1.8, 3: 5, 4: 22.5},
+    5:  {1: 0.25, 2: 1.4, 3: 4.1, 4: 16.5, 5: 36},
+    6:  {2: 1, 3: 3.68, 4: 7, 5: 16.5, 6: 40},
+    7:  {2: 0.47, 3: 3, 4: 4.5, 5: 14, 6: 31, 7: 60},
+    8:  {3: 2.2, 4: 4, 5: 13, 6: 22, 7: 55, 8: 70},
+    9:  {3: 1.55, 4: 3, 5: 8, 6: 15, 7: 44, 8: 60, 9: 85},
+    10: {3: 1.4, 4: 2.25, 5: 4.5, 6: 8, 7: 17, 8: 50, 9: 80, 10: 100},
 }
 
 
