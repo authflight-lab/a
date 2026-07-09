@@ -4,7 +4,7 @@ import math
 
 from api.game import keno
 
-TARGET = 1 - keno.KENO_EPS
+TARGET = (1 - keno.KENO_EPS) * keno.MULT_BOOST
 TOL = 1e-9
 
 

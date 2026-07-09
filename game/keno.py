@@ -37,6 +37,12 @@ from .seed import rng_float
 # than the 2% global EPS so the Classic curve pays out with a Rainbet-like feel.
 KENO_EPS = 0.01
 
+# Payout boost: every multiplier is lifted 5% above the fair (1 - KENO_EPS) line,
+# so the effective RTP is (1 - KENO_EPS) * MULT_BOOST ~= 1.04 — a deliberate
+# slight NEGATIVE edge (per owner request) for a more generous feel. Set to 1.0
+# to run a true 1% house edge. The RTP test derives its target from this.
+MULT_BOOST = 1.05
+
 GRID, DRAW, MAX_PICKS = 40, 10, 10
 
 # Relative payout weights per (picks k, hits h). Missing hit counts pay 0. This
@@ -73,7 +79,7 @@ def _build_paytable() -> dict[int, dict[int, float]]:
     table: dict[int, dict[int, float]] = {}
     for k, shape in SHAPE.items():
         raw = sum(p_hit(k, h) * m for h, m in shape.items())
-        factor = (1 - KENO_EPS) / raw
+        factor = (1 - KENO_EPS) * MULT_BOOST / raw
         table[k] = {h: shape.get(h, 0.0) * factor for h in range(k + 1)}
     return table
 
