@@ -66,6 +66,32 @@ async def _cashout_stale_round(rnd: dict) -> None:
     ss, cs, nonce = rnd["server_seed"], rnd["client_seed"], int(rnd["nonce"])
 
     try:
+        if name == "blackjack" and state.get("split"):
+            # A stale split settles as a STAND on every not-yet-done hand: play
+            # the dealer once (only if a hand is still live) and resolve each
+            # hand independently, exactly what a /step stand chain would have
+            # produced. Settled here directly (per-hand payouts can't be a single
+            # multiplier) and returns before the generic _finalise below.
+            dealer = list(state.get("dealer") or [])
+            cursor = int(state.get("next_cursor", 4))
+            hands = [dict(h) for h in (state.get("hands") or [])]
+            for h in hands:
+                h["cards"] = list(h.get("cards") or [])
+            draw = lambda i: rng_float(ss, cs, nonce, i)
+            if any(not blackjack.is_bust(blackjack.hand_total(h["cards"])[0]) for h in hands):
+                dealer, cursor = blackjack.play_dealer(draw, dealer, cursor)
+            results, total_payout = [], 0
+            for h in hands:
+                m = blackjack.outcome_multiplier(h["cards"], dealer)
+                results.append(m)
+                if m > 0:
+                    total_payout += _payout(int(h["bet"]), m)
+            outcome = {"dealer": dealer, "next_cursor": cursor, "split": True,
+                       "aces": bool(state.get("aces")), "hands": hands,
+                       "active": None, "player_done": True, "results": results}
+            await _finalise(rnd, tg_id, 0.0, "timed_out", outcome, payout_override=total_payout)
+            logger.info("stale_round_swept round=%s game=blackjack(split) tg_id=%s", rnd["id"], tg_id)
+            return
         if name == "blackjack":
             # A stale hand settles as a STAND on the player's current cards —
             # the least-punitive deterministic resolution (mirrors how the
@@ -1125,7 +1151,8 @@ async def _persist_step(rnd: dict, new_state: dict) -> bool:
     return True
 
 
-async def _finalise(rnd: dict, tg_id: int, multiplier: float, status: str, outcome: dict):
+async def _finalise(rnd: dict, tg_id: int, multiplier: float, status: str, outcome: dict,
+                    payout_override: int | None = None):
     """Atomically close the round (guarded on status='open') AND credit any win.
 
     Delegates to the ``bt_settle_round`` RPC so the close and the payout credit
@@ -1137,7 +1164,10 @@ async def _finalise(rnd: dict, tg_id: int, multiplier: float, status: str, outco
     either committed with the close or not at all).
     """
     bet = int(rnd["bet"])
-    payout = _payout(bet, multiplier) if multiplier > 0 else 0
+    if payout_override is not None:
+        payout = int(payout_override)
+    else:
+        payout = _payout(bet, multiplier) if multiplier > 0 else 0
     res = await db.settle_round(rnd["id"], tg_id, outcome, payout, status)
     _round_cache_pop(rnd["id"])
     if not res.get("closed"):
@@ -1151,6 +1181,176 @@ async def _finalise(rnd: dict, tg_id: int, multiplier: float, status: str, outco
         "new_balance": int(res.get("new_balance", 0)),
         "server_hash": rnd["server_hash"],
     }
+
+
+def _bj_next_active(hands: list[dict], after: int) -> int | None:
+    """Index of the next not-yet-done hand after ``after``, or None if all done."""
+    for i in range(after + 1, len(hands)):
+        if not hands[i].get("done"):
+            return i
+    return None
+
+
+def _bj_split_step_resp(rnd: dict, hands: list[dict], active, aces: bool, **extra) -> dict:
+    """Mid-split /step response: hands (cards only), whose turn, ace flag."""
+    resp = {
+        "outcome_step": {"split": True, "aces": aces, "active": active,
+                         "hands": [list(h["cards"]) for h in hands]},
+        "multiplier": 0.0, "can_cashout": False, "busted": False,
+        "done": False, "bet": int(rnd["bet"]),
+    }
+    resp["outcome_step"].update(extra)
+    return resp
+
+
+async def _bj_settle_split(rnd: dict, tg_id: int, dealer: list[int], hands: list[dict],
+                           cursor: int, ss: str, cs: str, nonce: int, aces: bool) -> dict:
+    """All player hands are done — play the dealer once (only if a hand is still
+    live) and resolve each hand independently against it. The credited payout is
+    the SUM of the per-hand payouts (each hand keeps its own — possibly doubled —
+    stake), passed to _finalise as an explicit override since two hands with
+    different multipliers can't be one round-level multiplier."""
+    draw = lambda i: rng_float(ss, cs, nonce, i)
+    if any(not blackjack.is_bust(blackjack.hand_total(h["cards"])[0]) for h in hands):
+        dealer, cursor = blackjack.play_dealer(draw, dealer, cursor)
+    results, total_payout = [], 0
+    for h in hands:
+        m = blackjack.outcome_multiplier(h["cards"], dealer)
+        results.append(m)
+        if m > 0:
+            total_payout += _payout(int(h["bet"]), m)
+    total_bet = int(rnd["bet"])
+    outcome = {"dealer": dealer, "next_cursor": cursor, "split": True, "aces": aces,
+               "hands": hands, "active": None, "player_done": True, "results": results}
+    final = await _finalise(rnd, tg_id, 0.0, "settled", outcome, payout_override=total_payout)
+    if final.get("ok") is False:
+        return final
+    eff = round(total_payout / total_bet, 4) if total_bet else 0.0
+    busted_all = all(blackjack.is_bust(blackjack.hand_total(h["cards"])[0]) for h in hands)
+    return {"outcome_step": {"split": True, "aces": aces, "active": None,
+                             "hands": [list(h["cards"]) for h in hands],
+                             "dealer": dealer, "results": results},
+            "multiplier": eff, "can_cashout": False, "busted": busted_all,
+            "done": True, "bet": total_bet, **final}
+
+
+async def _bj_split(rnd: dict, tg_id: int, state: dict, ss: str, cs: str, nonce: int) -> dict:
+    """Handle the ``split`` action: divide the opening two identical-rank cards
+    into two hands, deal one card to each, and atomically debit a second stake
+    equal to the round's bet (bt_split_round). Split aces get one card each and
+    auto-stand; a fresh split hand that makes 21 also auto-stands."""
+    player = list(state.get("player") or [])
+    dealer = list(state.get("dealer") or [])
+    cursor = int(state.get("next_cursor", 4))
+    if not blackjack.can_split(player) or state.get("doubled") or bool(state.get("player_done")):
+        return _err("invalid_move")
+    draw = lambda i: rng_float(ss, cs, nonce, i)
+    base_bet = int(rnd["bet"])  # the single-hand stake (never doubled before a split)
+    aces = blackjack.is_ace_pair(player)
+    c0, c1 = player[0], player[1]
+    card0 = blackjack.draw_card(draw, cursor); cursor += 1
+    card1 = blackjack.draw_card(draw, cursor); cursor += 1
+    hands = [
+        {"cards": [c0, card0], "bet": base_bet, "doubled": False, "done": False},
+        {"cards": [c1, card1], "bet": base_bet, "doubled": False, "done": False},
+    ]
+    for h in hands:
+        t, _ = blackjack.hand_total(h["cards"])
+        if aces or t == 21:
+            h["done"] = True
+    active = _bj_next_active(hands, -1)
+    committed = {"dealer": dealer, "next_cursor": cursor, "split": True, "aces": aces,
+                 "hands": hands, "active": active, "player_done": active is None}
+    try:
+        bal = await db.split_round(rnd["id"], tg_id, base_bet, committed)
+    except InsufficientBalance:
+        return _err("insufficient_balance")
+    if bal is None:
+        return _err("round_not_open")
+    rnd["bet"] = int(bal["bet"])
+    rnd["outcome"] = dict(committed)
+    if active is None:
+        return await _bj_settle_split(rnd, tg_id, dealer, hands, cursor, ss, cs, nonce, aces)
+    resp = _bj_split_step_resp(rnd, hands, active, aces)
+    resp["balance"] = bal["balance"]
+    return resp
+
+
+async def _bj_step_split(rnd: dict, tg_id: int, state: dict, ss: str, cs: str, nonce: int,
+                         action) -> dict:
+    """Hit / stand / double on the active hand of a split round, advancing to the
+    next hand (and settling once both are done)."""
+    if action not in ("hit", "stand", "double"):
+        return _err("invalid_move")
+    dealer = list(state.get("dealer") or [])
+    cursor = int(state.get("next_cursor", 4))
+    hands = [dict(h) for h in (state.get("hands") or [])]
+    for h in hands:
+        h["cards"] = list(h.get("cards") or [])
+    aces = bool(state.get("aces"))
+    active = state.get("active")
+    if active is None or active >= len(hands) or hands[active].get("done"):
+        return _err("invalid_move")
+    draw = lambda i: rng_float(ss, cs, nonce, i)
+    h = hands[active]
+
+    if action == "double":
+        # Double-after-split: only on a fresh two-card hand, once. Debits an
+        # extra stake equal to this hand's bet and persists the committed hand
+        # atomically (bt_double_round), then the hand stands with its one card.
+        if len(h["cards"]) != 2 or h.get("doubled"):
+            return _err("invalid_move")
+        extra = int(h["bet"])
+        h["cards"].append(blackjack.draw_card(draw, cursor)); cursor += 1
+        h["bet"] = extra * 2
+        h["doubled"] = True
+        h["done"] = True
+        nxt = _bj_next_active(hands, active)
+        committed = {"dealer": dealer, "next_cursor": cursor, "split": True, "aces": aces,
+                     "hands": hands, "active": nxt, "player_done": nxt is None}
+        try:
+            bal = await db.double_round(rnd["id"], tg_id, extra, committed)
+        except InsufficientBalance:
+            # Roll back the optimistic mutation so a retry can double again.
+            return _err("insufficient_balance")
+        if bal is None:
+            return _err("round_not_open")
+        rnd["bet"] = int(bal["bet"])
+        rnd["outcome"] = dict(committed)
+        if nxt is None:
+            return await _bj_settle_split(rnd, tg_id, dealer, hands, cursor, ss, cs, nonce, aces)
+        resp = _bj_split_step_resp(rnd, hands, nxt, aces)
+        resp["balance"] = bal["balance"]
+        return resp
+
+    if action == "hit":
+        if aces:
+            return _err("invalid_move")  # split aces take exactly one card
+        h["cards"].append(blackjack.draw_card(draw, cursor)); cursor += 1
+        t, _ = blackjack.hand_total(h["cards"])
+        if blackjack.is_bust(t) or t == 21:
+            h["done"] = True
+        nxt = active if not h.get("done") else _bj_next_active(hands, active)
+        new_state = {"dealer": dealer, "next_cursor": cursor, "split": True, "aces": aces,
+                     "hands": hands, "active": nxt, "player_done": nxt is None}
+        if nxt is None:
+            rnd["outcome"] = new_state
+            return await _bj_settle_split(rnd, tg_id, dealer, hands, cursor, ss, cs, nonce, aces)
+        if not await _persist_step(rnd, new_state):
+            return _err("round_not_open")
+        return _bj_split_step_resp(rnd, hands, nxt, aces, last_bust=blackjack.is_bust(t))
+
+    # stand
+    h["done"] = True
+    nxt = _bj_next_active(hands, active)
+    new_state = {"dealer": dealer, "next_cursor": cursor, "split": True, "aces": aces,
+                 "hands": hands, "active": nxt, "player_done": nxt is None}
+    if nxt is None:
+        rnd["outcome"] = new_state
+        return await _bj_settle_split(rnd, tg_id, dealer, hands, cursor, ss, cs, nonce, aces)
+    if not await _persist_step(rnd, new_state):
+        return _err("round_not_open")
+    return _bj_split_step_resp(rnd, hands, nxt, aces)
 
 
 async def _void_open_round(rnd: dict, tg_id: int) -> None:
@@ -1393,6 +1593,10 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
 
     if name == "blackjack":
         action = move.get("action") if isinstance(move, dict) else move
+        if state.get("split"):
+            return await _bj_step_split(rnd, tg_id, state, ss, cs, nonce, action)
+        if action == "split":
+            return await _bj_split(rnd, tg_id, state, ss, cs, nonce)
         if action not in ("hit", "stand", "double"):
             return _err("invalid_move")
         player = list(state.get("player") or [])

@@ -135,6 +135,18 @@ def natural_outcome(player: list[int], dealer: list[int]) -> float | None:
     return 2.5
 
 
+def can_split(cards: list[int]) -> bool:
+    """Split is offered only on the opening two IDENTICAL ranks (8+8 yes; K+Q
+    no) — the user-chosen rule. Ten-value ranks (10/J/Q/K) are distinct ranks,
+    so a K+Q or 10+J is NOT splittable, matching real identical-rank tables."""
+    return len(cards) == 2 and cards[0] == cards[1]
+
+
+def is_ace_pair(cards: list[int]) -> bool:
+    """A pair of Aces gets special split handling: one card each, then stand."""
+    return len(cards) == 2 and cards[0] == 1 and cards[1] == 1
+
+
 def rtp_distribution(n_samples: int = 200_000) -> list[tuple[float, float]]:
     """Monte-Carlo outcome distribution under a simple always-stand-on-17-vs-
     hit-below-17 player strategy (mirrors the dealer's own fixed rule), used
