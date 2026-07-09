@@ -2,9 +2,9 @@
 
 import math
 
-from api.game import EPS, keno
+from api.game import keno
 
-TARGET = 1 - EPS
+TARGET = 1 - keno.KENO_EPS
 TOL = 1e-9
 
 

@@ -31,8 +31,11 @@ REJECTION-SAMPLED index (``_draw_index``) built from the same HMAC bytes.
 
 import math
 
-from . import EPS
 from .seed import rng_float
+
+# Keno runs a 1% house edge (its own constant, like HighLow's HL_EPS) — lower
+# than the 2% global EPS so the Classic curve pays out with a Rainbet-like feel.
+KENO_EPS = 0.01
 
 GRID, DRAW, MAX_PICKS = 40, 10, 10
 
@@ -66,11 +69,11 @@ def p_hit(k: int, h: int) -> float:
 
 
 def _build_paytable() -> dict[int, dict[int, float]]:
-    """Rescale each SHAPE row so its RTP is exactly ``1 - EPS`` (unrounded)."""
+    """Rescale each SHAPE row so its RTP is exactly ``1 - KENO_EPS`` (unrounded)."""
     table: dict[int, dict[int, float]] = {}
     for k, shape in SHAPE.items():
         raw = sum(p_hit(k, h) * m for h, m in shape.items())
-        factor = (1 - EPS) / raw
+        factor = (1 - KENO_EPS) / raw
         table[k] = {h: shape.get(h, 0.0) * factor for h in range(k + 1)}
     return table
 
