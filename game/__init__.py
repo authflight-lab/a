@@ -21,11 +21,11 @@ MULT_CAP = 25.0
 BET_MIN = 1
 BET_MAX = 350
 
-SINGLE_SETTLE = ("dice", "plinko")
+SINGLE_SETTLE = ("dice", "plinko", "keno")
 MULTI_STEP = ("flip", "mines", "towers", "highlow", "rps", "chicken")
 # Blackjack is neither SINGLE_SETTLE nor MULTI_STEP: it deals at /bet (settling
 # immediately on a player natural), takes /step moves (hit/stand/double), and
 # has NO /cashout (there's no partial-progress multiplier to bank early — a
 # hand is always played to a stand/bust/double, so /cashout is rejected for it
 # exactly like crash rejects /step). Special-cased throughout main.py.
-GAMES = ("dice", "flip", "mines", "towers", "highlow", "plinko", "rps", "chicken", "crash", "blackjack")
+GAMES = ("dice", "flip", "mines", "towers", "highlow", "plinko", "rps", "chicken", "crash", "blackjack", "keno")

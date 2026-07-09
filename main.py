@@ -28,7 +28,7 @@ from .auth import require_user
 from .config import settings
 from .db import InsufficientBalance, SupabaseNotConfigured
 from .game import BET_MAX, BET_MIN, GAMES, MULT_CAP, MULTI_STEP, P_MAX, SINGLE_SETTLE
-from .game import blackjack, chicken, crash, dice, flip, highlow, mines, plinko, rps, seedpair, towers
+from .game import blackjack, chicken, crash, dice, flip, highlow, keno, mines, plinko, rps, seedpair, towers
 from .game.seed import rng_float
 
 app = FastAPI(title="Bartender API", version="1.0")
@@ -853,6 +853,23 @@ def _validate_params(name: str, params: dict) -> tuple[bool, dict]:
         return (plinko.valid_rows(rows) and plinko.valid_risk(risk), {"rows": rows, "risk": risk})
     if name == "blackjack":
         return (True, {})
+    if name == "keno":
+        raw = p.get("picks", [])
+        if not isinstance(raw, (list, tuple)):
+            return (False, {})
+        # Coerce to ints (JSON may deliver floats like 21.0) before validating.
+        picks = []
+        for v in raw:
+            if isinstance(v, bool):
+                return (False, {})
+            if isinstance(v, int):
+                picks.append(v)
+            elif isinstance(v, float) and v.is_integer():
+                picks.append(int(v))
+            else:
+                return (False, {})
+        # Store sorted for a stable, canonical params shape.
+        return (keno.valid_picks(picks), {"picks": sorted(picks)})
     return (False, {})
 
 
@@ -1394,10 +1411,11 @@ async def game_settle(name: str, user: dict = Depends(require_user), body: dict 
     params = rnd.get("params") or {}
     if name == "dice":
         result = dice.settle(ss, cs, nonce, int(params["target"]))
-        multiplier = result["multiplier"]
+    elif name == "keno":
+        result = keno.play(ss, cs, nonce, list(params["picks"]))
     else:  # plinko
         result = plinko.drop(ss, cs, nonce, int(params["rows"]), str(params["risk"]))
-        multiplier = result["multiplier"]
+    multiplier = result["multiplier"]
     return await _finalise(rnd, tg_id, multiplier, "settled", result)
 
 
@@ -1424,6 +1442,8 @@ async def game_play(name: str, user: dict = Depends(require_user), body: dict | 
     params = rnd.get("params") or {}
     if name == "dice":
         result = dice.settle(ss, cs, nonce, int(params["target"]))
+    elif name == "keno":
+        result = keno.play(ss, cs, nonce, list(params["picks"]))
     else:  # plinko
         result = plinko.drop(ss, cs, nonce, int(params["rows"]), str(params["risk"]))
     settled = await _finalise(rnd, tg_id, result["multiplier"], "settled", result)
