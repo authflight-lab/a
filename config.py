@@ -41,6 +41,9 @@ class Settings:
     )
     # Exact origin of the deployed Mini App; the CORS allowlist is built from this.
     bt_app_origin: str = ""
+    # Target chat for referral invite links (Invites page). A public @username
+    # works for createChatInviteLink; override via env for a private chat id.
+    bt_partygc_chat_id: str = "@partygc"
 
     # ── Rate limits (env-overridable, e.g. BT_RL_GAME_LIMIT=90) ──────────────
     # Pre-auth per-IP guard across all /bt/api/ routes. Generous because mobile

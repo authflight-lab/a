@@ -500,6 +500,141 @@ async def has_redeemed_today(tg_id: int, day_start_iso: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Referrals / Invites (Mini App "Invites" page)
+# ---------------------------------------------------------------------------
+
+async def get_invite_link(tg_id: int) -> dict | None:
+    """The user's stored permanent invite link row, or None if not created yet."""
+    try:
+        pool = await pgpool.get_pool()
+        rec = await pool.fetchrow(
+            "select tg_id, link, member_limit, name, created_at "
+            "from bt_referral_links where tg_id = $1 limit 1", tg_id)
+        return _row(rec)
+    except Exception as e:  # noqa: BLE001
+        if pgpool.should_fallback(e):
+            rows = await _get("bt_referral_links",
+                              {"tg_id": f"eq.{tg_id}", "select": "*", "limit": "1"})
+            return rows[0] if rows else None
+        raise
+
+
+async def insert_invite_link(tg_id: int, link: str, member_limit: int,
+                             name: str | None) -> dict | None:
+    """Insert the user's permanent link if absent (ignore-duplicates), then
+    return the STORED row. On a concurrent double-tap the first insert wins and
+    this re-reads it, so a user is never handed two different links."""
+    client = _get_client()
+    row = {
+        "tg_id": tg_id,
+        "link": link,
+        "member_limit": member_limit,
+        "name": name,
+        "created_at": _now(),
+    }
+    r = await client.post(
+        "/bt_referral_links",
+        params={"on_conflict": "tg_id"},
+        json=row,
+        headers={"Prefer": "resolution=ignore-duplicates,return=representation"},
+    )
+    r.raise_for_status()
+    data = r.json() if r.content else None
+    if isinstance(data, list) and data:
+        return data[0]
+    # Conflict — the row already existed; return the winning row.
+    return await get_invite_link(tg_id)
+
+
+async def generate_invite_link(tg_id: int, name: str | None, member_limit: int,
+                               create_fn) -> dict | None:
+    """Race-safe idempotent link generation.
+
+    Holds a session-level Postgres advisory lock keyed on ``tg_id`` across the
+    Telegram ``createChatInviteLink`` call (``create_fn``, an async callable
+    returning the link string or None) so two concurrent first-time requests can
+    never both create a Telegram link — exactly one link is created and stored
+    per user. Returns the stored link row.
+
+    On pool failure the REST path falls back to an ignore-duplicates insert; it
+    cannot hold a cross-call lock, so a rare concurrent double-create could orphan
+    an unused Telegram link, but the stored (and surfaced) link stays single.
+    """
+    pool = None
+    try:
+        pool = await pgpool.get_pool()
+    except Exception as e:  # noqa: BLE001
+        if not pgpool.should_fallback(e):
+            raise
+
+    if pool is not None:
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute("select pg_advisory_lock($1)", tg_id)
+                try:
+                    rec = await conn.fetchrow(
+                        "select tg_id, link, member_limit, name, created_at "
+                        "from bt_referral_links where tg_id = $1", tg_id)
+                    if rec:
+                        return _row(rec)
+                    link = await create_fn()
+                    if not link:
+                        return None
+                    rec = await conn.fetchrow(
+                        "insert into bt_referral_links (tg_id, link, member_limit, name) "
+                        "values ($1, $2, $3, $4) "
+                        "returning tg_id, link, member_limit, name, created_at",
+                        tg_id, link, member_limit, name)
+                    return _row(rec)
+                finally:
+                    await conn.execute("select pg_advisory_unlock($1)", tg_id)
+        except Exception as e:  # noqa: BLE001
+            if not pgpool.should_fallback(e):
+                raise
+            # fall through to REST path
+
+    existing = await get_invite_link(tg_id)
+    if existing and existing.get("link"):
+        return existing
+    link = await create_fn()
+    if not link:
+        return None
+    return await insert_invite_link(tg_id, link, member_limit, name)
+
+
+async def invite_stats(tg_id: int) -> dict:
+    """Referral stats for the Invites page:
+
+    - ``referred_count``: paid joins the user referred (bt_referrals rows where
+      they are the referrer and paid_join is true).
+    - ``total_earned``: sum of referral-kind ledger amounts credited to them.
+
+    Aggregated DB-side (pool) so the ledger sum isn't capped by PostgREST's
+    ~1000-row limit; REST fallback only on pool failure.
+    """
+    try:
+        pool = await pgpool.get_pool()
+        referred = await pool.fetchval(
+            "select count(*) from bt_referrals "
+            "where referrer_id = $1 and paid_join = true", tg_id)
+        earned = await pool.fetchval(
+            "select coalesce(sum(amount), 0) from bt_ledger "
+            "where tg_id = $1 and kind = 'referral'", tg_id)
+        return {"referred_count": int(referred or 0), "total_earned": int(earned or 0)}
+    except Exception as e:  # noqa: BLE001
+        if not pgpool.should_fallback(e):
+            raise
+    rows = await _get("bt_referrals", {
+        "referrer_id": f"eq.{tg_id}", "paid_join": "eq.true", "select": "referred_id",
+    })
+    led = await _get("bt_ledger", {
+        "tg_id": f"eq.{tg_id}", "kind": "eq.referral", "select": "amount",
+    })
+    earned = sum(int(x.get("amount", 0)) for x in led)
+    return {"referred_count": len(rows), "total_earned": earned}
+
+
+# ---------------------------------------------------------------------------
 # Seed pairs (provably-fair, Rainbet-style reuse; see api/game/seedpair.py)
 # ---------------------------------------------------------------------------
 
