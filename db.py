@@ -517,12 +517,9 @@ async def get_invite_link(tg_id: int) -> dict | None:
         return None
     except Exception as e:  # noqa: BLE001
         if pgpool.should_fallback(e):
-            try:
-                rows = await _get("bt_referral_links",
-                                  {"tg_id": f"eq.{tg_id}", "select": "*", "limit": "1"})
-                return rows[0] if rows else None
-            except Exception:  # noqa: BLE001
-                return None
+            rows = await _get("bt_referral_links",
+                              {"tg_id": f"eq.{tg_id}", "select": "*", "limit": "1"})
+            return rows[0] if rows else None
         raise
 
 
@@ -635,15 +632,12 @@ async def invite_stats(tg_id: int) -> dict:
     except Exception as e:  # noqa: BLE001
         if not pgpool.should_fallback(e):
             raise
-    try:
-        rows = await _get("bt_referrals", {
-            "referrer_id": f"eq.{tg_id}", "paid_join": "eq.true", "select": "referred_id",
-        })
-        led = await _get("bt_ledger", {
-            "tg_id": f"eq.{tg_id}", "kind": "eq.referral", "select": "amount",
-        })
-    except Exception:  # noqa: BLE001
-        return {"referred_count": 0, "total_earned": 0}
+    rows = await _get("bt_referrals", {
+        "referrer_id": f"eq.{tg_id}", "paid_join": "eq.true", "select": "referred_id",
+    })
+    led = await _get("bt_ledger", {
+        "tg_id": f"eq.{tg_id}", "kind": "eq.referral", "select": "amount",
+    })
     earned = sum(int(x.get("amount", 0)) for x in led)
     return {"referred_count": len(rows), "total_earned": earned}
 
@@ -1559,10 +1553,7 @@ async def vip_levels(tg_ids: list[int]) -> dict[int, int]:
         return {}
     except Exception as e:  # noqa: BLE001
         if pgpool.should_fallback(e):
-            try:
-                return await _vip_levels_rest(uniq)
-            except Exception:  # noqa: BLE001
-                return {}
+            return await _vip_levels_rest(uniq)
         raise
 
 
