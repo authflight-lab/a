@@ -19,7 +19,7 @@ P_MAX = 2000
 # round far beyond the point-earning economy. A capped step auto-cashes out.
 MULT_CAP = 25.0
 BET_MIN = 1
-BET_MAX = 350
+BET_MAX = 500
 
 SINGLE_SETTLE = ("dice", "plinko", "keno")
 MULTI_STEP = ("flip", "mines", "towers", "highlow", "rps", "chicken")
