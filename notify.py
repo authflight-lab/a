@@ -60,32 +60,6 @@ async def _send(tg_id: int, payload: dict) -> bool:
         return False
 
 
-async def create_chat_invite_link(chat_id: object, name: str, member_limit: int) -> str | None:
-    """Create a named, join-capped invite link on ``chat_id`` via the Bot API.
-
-    ``member_limit`` and ``creates_join_request`` are mutually exclusive in the
-    Telegram API, so we set ONLY the cap (creates_join_request defaults to false).
-    Returns the ``invite_link`` string, or None on any failure (never raises).
-    """
-    token = settings.bot_token
-    if not token:
-        logger.warning("bt_invite_no_token")
-        return None
-    url = f"{_TELEGRAM_API}/bot{token}/createChatInviteLink"
-    payload = {"chat_id": chat_id, "name": name, "member_limit": member_limit}
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(url, json=payload)
-        data = resp.json()
-        if resp.status_code == 200 and data.get("ok"):
-            return data.get("result", {}).get("invite_link")
-        logger.warning("bt_invite_link_failed status=%s body=%s", resp.status_code, data)
-        return None
-    except Exception as e:
-        logger.warning("bt_invite_link_error error=%s", e)
-        return None
-
-
 async def send_dm(tg_id: int, text: str) -> bool:
     """Send an HTML DM to ``tg_id``. Returns True on success, False otherwise.
 
