@@ -1538,9 +1538,17 @@ async def vip_levels(tg_ids: list[int]) -> dict[int, int]:
             "where tg_id = any($1::bigint[])",
             uniq)
         return {int(r["tg_id"]): int(r["current_level"] or 0) for r in recs}
+    except asyncpg.exceptions.UndefinedTableError:
+        # VIP migration not applied on this DB yet — degrade to "everyone
+        # Unranked" instead of 500ing the whole leaderboard. Badges light up
+        # once 2026-07-10_vip_tiers.sql is applied.
+        return {}
     except Exception as e:  # noqa: BLE001
         if pgpool.should_fallback(e):
-            return await _vip_levels_rest(uniq)
+            try:
+                return await _vip_levels_rest(uniq)
+            except Exception:  # noqa: BLE001
+                return {}
         raise
 
 
