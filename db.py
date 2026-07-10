@@ -511,11 +511,18 @@ async def get_invite_link(tg_id: int) -> dict | None:
             "select tg_id, link, member_limit, name, created_at "
             "from bt_referral_links where tg_id = $1 limit 1", tg_id)
         return _row(rec)
+    except asyncpg.exceptions.UndefinedTableError:
+        # Referral migration not applied on this DB yet — no link exists.
+        # Degrade to None so the Invites page renders instead of 500ing.
+        return None
     except Exception as e:  # noqa: BLE001
         if pgpool.should_fallback(e):
-            rows = await _get("bt_referral_links",
-                              {"tg_id": f"eq.{tg_id}", "select": "*", "limit": "1"})
-            return rows[0] if rows else None
+            try:
+                rows = await _get("bt_referral_links",
+                                  {"tg_id": f"eq.{tg_id}", "select": "*", "limit": "1"})
+                return rows[0] if rows else None
+            except Exception:  # noqa: BLE001
+                return None
         raise
 
 
@@ -621,15 +628,22 @@ async def invite_stats(tg_id: int) -> dict:
             "select coalesce(sum(amount), 0) from bt_ledger "
             "where tg_id = $1 and kind = 'referral'", tg_id)
         return {"referred_count": int(referred or 0), "total_earned": int(earned or 0)}
+    except asyncpg.exceptions.UndefinedTableError:
+        # Referral migration not applied yet — report zero stats rather than
+        # 500ing the whole Invites page.
+        return {"referred_count": 0, "total_earned": 0}
     except Exception as e:  # noqa: BLE001
         if not pgpool.should_fallback(e):
             raise
-    rows = await _get("bt_referrals", {
-        "referrer_id": f"eq.{tg_id}", "paid_join": "eq.true", "select": "referred_id",
-    })
-    led = await _get("bt_ledger", {
-        "tg_id": f"eq.{tg_id}", "kind": "eq.referral", "select": "amount",
-    })
+    try:
+        rows = await _get("bt_referrals", {
+            "referrer_id": f"eq.{tg_id}", "paid_join": "eq.true", "select": "referred_id",
+        })
+        led = await _get("bt_ledger", {
+            "tg_id": f"eq.{tg_id}", "kind": "eq.referral", "select": "amount",
+        })
+    except Exception:  # noqa: BLE001
+        return {"referred_count": 0, "total_earned": 0}
     earned = sum(int(x.get("amount", 0)) for x in led)
     return {"referred_count": len(rows), "total_earned": earned}
 
