@@ -1153,6 +1153,17 @@ async def _open_bet(name: str, user: dict, body: dict | None):
         # ends (stand/bust/double), exactly like a real table.
         resp["player"] = state["player"]
         resp["dealer_up"] = state["dealer"][0]
+    if name == "crash":
+        # The client's local clock only starts once this response arrives —
+        # well after the server actually stamped t0_ms — so without this the
+        # client curve always lags the true server clock by the bet round
+        # trip, and that fixed offset compounds under the exponential curve
+        # into a large visible multiplier gap (never favors the player).
+        # Ship t0_ms plus this response's own send time so the client can
+        # estimate clock skew and anchor its animation to the server's true
+        # elapsed time instead of a local "now" reset on arrival.
+        resp["t0_ms"] = state["t0_ms"]
+        resp["server_now_ms"] = int(time.time() * 1000)
     return rnd, resp, None
 
 
