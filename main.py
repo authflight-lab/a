@@ -272,6 +272,27 @@ async def _supabase_not_configured(_request: Request, _exc: SupabaseNotConfigure
     return JSONResponse(status_code=503, content={"ok": False, "error": "supabase_not_configured"})
 
 
+@app.exception_handler(HTTPException)
+async def _http_exception(_request: Request, exc: HTTPException):
+    """Flatten dict-shaped ``detail`` into the top-level body.
+
+    FastAPI's default handler nests ``detail`` (e.g. ``raise
+    HTTPException(401, detail={"error": "bad_init_data"})``) as
+    ``{"detail": {"error": "bad_init_data"}}``. Every other error response in
+    this API (rate limits, SupabaseNotConfigured, etc.) is a flat
+    ``{"ok": false, "error": ...}`` body, and app/js/api.js's client only ever
+    reads a top-level ``error`` field — so a nested detail silently never
+    reaches the app's error-code branches. Flatten it here, once, for every
+    HTTPException raised anywhere in the API, preserving headers (e.g.
+    Retry-After) and any non-dict detail (e.g. FastAPI's own validation 422s).
+    """
+    if isinstance(exc.detail, dict):
+        content = {"ok": False, **exc.detail}
+    else:
+        content = {"ok": False, "error": exc.detail}
+    return JSONResponse(status_code=exc.status_code, content=content, headers=exc.headers)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

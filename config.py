@@ -61,6 +61,12 @@ class Settings:
     # Per-user read endpoints (leaderboard, history, bets, rewards).
     bt_rl_read_limit: int = 40
     bt_rl_read_window_sec: int = 60
+    # GLOBAL (not per-IP/per-user) budget for 401 auth failures across the whole
+    # API. A 401 is rejected before any UI pacing applies, so unlike every other
+    # status code it has no natural ceiling; there is no legitimate scenario
+    # where real users produce 60+ combined auth failures per minute.
+    bt_rl_auth_fail_limit: int = 60
+    bt_rl_auth_fail_window_sec: int = 60
 
     def __post_init__(self) -> None:
         # Environment overrides (same field name, upper-cased) win when present.

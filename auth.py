@@ -13,11 +13,36 @@ from urllib.parse import parse_qsl
 
 from fastapi import Header, HTTPException
 
+from . import ratelimit
 from .config import settings
 
 
 class InitDataError(Exception):
     """Raised when initData fails HMAC validation or is stale."""
+
+
+def _reject_unauthenticated():
+    """Raise 429 once the global failed-auth budget is spent, else raise 401.
+
+    A 401 is rejected before any of the app's own UI pacing ever applies (no
+    button tap, no poll interval, nothing) — unlike every other status code,
+    an external caller hitting the API directly can trigger 401s as fast as
+    the network allows. There is no legitimate scenario where genuine users
+    produce 60+ auth failures per minute combined across the whole app, so
+    this is a single GLOBAL budget (not per-IP/per-user, config
+    bt_rl_auth_fail_*): once it's exhausted, further auth failures are told
+    to back off with 429 instead of paying out a fresh 401 on every request.
+    """
+    allowed, retry_after = ratelimit.check(
+        "401:global", limit=settings.bt_rl_auth_fail_limit, window_sec=settings.bt_rl_auth_fail_window_sec
+    )
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail={"error": "too_many_failed_auth"},
+            headers={"Retry-After": str(retry_after)},
+        )
+    raise HTTPException(status_code=401, detail={"error": "bad_init_data"})
 
 
 def verify_init_data(init_data: str, bot_token: str, max_age: int = 3600) -> dict:
@@ -62,19 +87,19 @@ async def require_user(
     ``tg_id`` is taken exclusively from the validated ``initData.user`` payload.
     """
     if not x_telegram_init_data:
-        raise HTTPException(status_code=401, detail={"error": "bad_init_data"})
+        _reject_unauthenticated()
     if not settings.bot_token:
         # Cannot validate without the bot token — treated as not configured.
         raise HTTPException(status_code=503, detail={"error": "not_configured"})
     try:
         p = verify_init_data(x_telegram_init_data, settings.bot_token)
     except InitDataError:
-        raise HTTPException(status_code=401, detail={"error": "bad_init_data"})
+        _reject_unauthenticated()
     try:
         user = json.loads(p["user"])
         tg_id = int(user["id"])
     except (KeyError, ValueError, TypeError, json.JSONDecodeError):
-        raise HTTPException(status_code=401, detail={"error": "bad_init_data"})
+        _reject_unauthenticated()
     return {
         "tg_id": tg_id,
         "user": user,
