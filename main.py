@@ -785,6 +785,39 @@ async def invite_generate(user: dict = Depends(require_user)):
 
 
 # ---------------------------------------------------------------------------
+# VIP tiers
+# ---------------------------------------------------------------------------
+
+@app.get("/bt/api/vip")
+async def vip(user: dict = Depends(require_user)):
+    tg_id = user["tg_id"]
+    allowed, retry_after = ratelimit.check(
+        f"vip:{tg_id}", limit=settings.bt_rl_read_limit, window_sec=settings.bt_rl_read_window_sec)
+    if not allowed:
+        return _rl_err(retry_after)
+    data = await db.vip_get(tg_id)
+    return {"ok": True, "state": data["state"], "tiers": data["tiers"]}
+
+
+@app.post("/bt/api/vip/claim/{kind}")
+async def vip_claim(kind: str, user: dict = Depends(require_user)):
+    tg_id = user["tg_id"]
+    if kind not in ("rakeback", "weekly", "monthly"):
+        return JSONResponse(status_code=404, content={"ok": False, "error": "not_found"})
+    allowed, retry_after = ratelimit.check(f"vipclaim:{tg_id}", limit=10, window_sec=60)
+    if not allowed:
+        return _rl_err(retry_after)
+    try:
+        res = await db.vip_claim(tg_id, kind)
+    except db.SupabaseNotConfigured:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "not_configured"})
+    except Exception as e:  # noqa: BLE001
+        logging.getLogger(__name__).warning("bt_vip_claim_error", extra={"error": str(e), "kind": kind})
+        return {"ok": False, "error": "server_error"}
+    return res
+
+
+# ---------------------------------------------------------------------------
 # Leaderboard / history
 # ---------------------------------------------------------------------------
 

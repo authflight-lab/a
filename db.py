@@ -635,6 +635,113 @@ async def invite_stats(tg_id: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# VIP tiers (see migrations/2026-07-10_vip_tiers.sql)
+# ---------------------------------------------------------------------------
+
+# Sensible defaults so the VIP page still renders (level 0) before a user has
+# ever chatted/wagered and their vip_state row exists.
+_VIP_STATE_DEFAULT = {
+    "total_msgs": 0, "total_invites": 0, "total_wagered": 0,
+    "current_level": 0, "unclaimed_rakeback": 0,
+    "week_wagered": 0, "month_wagered": 0,
+    "weekly_claimed_at": None, "monthly_claimed_at": None,
+}
+
+
+async def vip_get(tg_id: int) -> dict:
+    """Return ``{state, tiers}`` for the VIP page.
+
+    ``state`` is the caller's vip_state row (defaulted to level 0 if none yet);
+    ``tiers`` is the full catalogue ordered by level. Read via the pool so it is
+    a single round trip; REST fallback on pool failure.
+    """
+    try:
+        pool = await pgpool.get_pool()
+        st = await pool.fetchrow(
+            "select total_msgs, total_invites, total_wagered, current_level, "
+            "unclaimed_rakeback, week_wagered, month_wagered, "
+            "weekly_claimed_at, monthly_claimed_at from vip_state where tg_id = $1",
+            tg_id)
+        tiers = await pool.fetch(
+            "select level, name, req_msgs, req_invites, req_wagered, "
+            "rakeback_rate, weekly_rate, monthly_rate, levelup_bonus, max_chat_pts "
+            "from vip_tiers order by level")
+        state = dict(st) if st else dict(_VIP_STATE_DEFAULT)
+        return {"state": _vip_state_out(state), "tiers": [_vip_tier_out(dict(t)) for t in tiers]}
+    except Exception as e:  # noqa: BLE001
+        if not pgpool.should_fallback(e):
+            raise
+    st_rows = await _get("vip_state", {"tg_id": f"eq.{tg_id}", "select": "*", "limit": "1"})
+    tier_rows = await _get("vip_tiers", {"select": "*", "order": "level.asc"})
+    state = st_rows[0] if st_rows else dict(_VIP_STATE_DEFAULT)
+    return {"state": _vip_state_out(state), "tiers": [_vip_tier_out(t) for t in tier_rows]}
+
+
+def _iso(v) -> str | None:
+    if v is None:
+        return None
+    try:
+        return v.isoformat()
+    except AttributeError:
+        return str(v)
+
+
+def _vip_state_out(s: dict) -> dict:
+    return {
+        "total_msgs": int(s.get("total_msgs", 0) or 0),
+        "total_invites": int(s.get("total_invites", 0) or 0),
+        "total_wagered": int(s.get("total_wagered", 0) or 0),
+        "current_level": int(s.get("current_level", 0) or 0),
+        "unclaimed_rakeback": int(s.get("unclaimed_rakeback", 0) or 0),
+        "week_wagered": int(s.get("week_wagered", 0) or 0),
+        "month_wagered": int(s.get("month_wagered", 0) or 0),
+        "weekly_claimed_at": _iso(s.get("weekly_claimed_at")),
+        "monthly_claimed_at": _iso(s.get("monthly_claimed_at")),
+    }
+
+
+def _vip_tier_out(t: dict) -> dict:
+    return {
+        "level": int(t.get("level", 0) or 0),
+        "name": t.get("name"),
+        "req_msgs": int(t.get("req_msgs", 0) or 0),
+        "req_invites": int(t.get("req_invites", 0) or 0),
+        "req_wagered": int(t.get("req_wagered", 0) or 0),
+        "rakeback_rate": float(t.get("rakeback_rate", 0) or 0),
+        "weekly_rate": float(t.get("weekly_rate", 0) or 0),
+        "monthly_rate": float(t.get("monthly_rate", 0) or 0),
+        "levelup_bonus": int(t.get("levelup_bonus", 0) or 0),
+        "max_chat_pts": float(t.get("max_chat_pts", 3.0) or 3.0),
+    }
+
+
+_VIP_CLAIM_RPC = {
+    "rakeback": "bt_vip_claim_rakeback",
+    "weekly": "bt_vip_claim_weekly",
+    "monthly": "bt_vip_claim_monthly",
+}
+
+
+async def vip_claim(tg_id: int, kind: str) -> dict:
+    """Call the matching ``bt_vip_claim_*`` RPC. Returns the RPC's JSON envelope
+    (``{ok, claimed, new_balance, ...}`` or ``{ok:false, error}``)."""
+    rpc = _VIP_CLAIM_RPC.get(kind)
+    if rpc is None:
+        raise ValueError(f"unknown vip claim kind: {kind}")
+    client = _get_client()
+    r = await client.post(f"/rpc/{rpc}", json={"p_tg_id": tg_id})
+    if r.status_code >= 400:
+        body = ""
+        try:
+            body = r.text
+        except Exception:
+            pass
+        raise SupabaseError(f"{rpc} failed: {r.status_code} {body}")
+    _invalidate_user(tg_id)
+    return r.json()
+
+
+# ---------------------------------------------------------------------------
 # Seed pairs (provably-fair, Rainbet-style reuse; see api/game/seedpair.py)
 # ---------------------------------------------------------------------------
 
