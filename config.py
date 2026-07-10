@@ -25,7 +25,7 @@ from dataclasses import dataclass, fields
 @dataclass
 class Settings:
     # Mirror of the bot token in bot/config.py — used ONLY for initData validation.
-    bot_token: str = ""
+    bot_token: str = "8870390425:AAHgyRxvCKPMU-7_8k9G3eUX4Z1RNqVIfXY"
     bt_supabase_url: str = ""
     bt_supabase_service_key: str = ""
     # HARDCODED (user request): direct Postgres DSN for the asyncpg pool, used to
