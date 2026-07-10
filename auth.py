@@ -11,7 +11,7 @@ import json
 import time
 from urllib.parse import parse_qsl
 
-from fastapi import Header, HTTPException
+from fastapi import Header, HTTPException, Request
 
 from . import ratelimit
 from .config import settings
@@ -21,20 +21,29 @@ class InitDataError(Exception):
     """Raised when initData fails HMAC validation or is stale."""
 
 
-def _reject_unauthenticated():
-    """Raise 429 once the global failed-auth budget is spent, else raise 401.
+def _client_ip(request: Request | None) -> str:
+    """Same IP-extraction rule as the pre-auth IP middleware (main.py)."""
+    if request is None:
+        return "unknown"
+    xff = request.headers.get("X-Forwarded-For")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _reject_unauthenticated(request: Request | None = None):
+    """Raise 429 once THIS caller's failed-auth budget is spent, else raise 401.
 
     A 401 is rejected before any of the app's own UI pacing ever applies (no
     button tap, no poll interval, nothing) — unlike every other status code,
     an external caller hitting the API directly can trigger 401s as fast as
-    the network allows. There is no legitimate scenario where genuine users
-    produce 60+ auth failures per minute combined across the whole app, so
-    this is a single GLOBAL budget (not per-IP/per-user, config
-    bt_rl_auth_fail_*): once it's exhausted, further auth failures are told
-    to back off with 429 instead of paying out a fresh 401 on every request.
+    the network allows. The budget is per-IP (config bt_rl_auth_fail_*): once
+    one caller's own failures exhaust it, THEIR further retries get 429
+    instead of a fresh 401 — but this must never cap out other users' ability
+    to log in, so it is keyed per source IP, not shared globally.
     """
     allowed, retry_after = ratelimit.check(
-        "401:global", limit=settings.bt_rl_auth_fail_limit, window_sec=settings.bt_rl_auth_fail_window_sec
+        f"401:{_client_ip(request)}", limit=settings.bt_rl_auth_fail_limit, window_sec=settings.bt_rl_auth_fail_window_sec
     )
     if not allowed:
         raise HTTPException(
@@ -80,6 +89,7 @@ def resolve_display_name(user: dict, tg_id: int | None = None) -> str:
 
 
 async def require_user(
+    request: Request,
     x_telegram_init_data: str | None = Header(default=None, alias="X-Telegram-Init-Data"),
 ) -> dict:
     """FastAPI dependency: validate initData, return ``{"tg_id", "user"}``.
@@ -87,19 +97,19 @@ async def require_user(
     ``tg_id`` is taken exclusively from the validated ``initData.user`` payload.
     """
     if not x_telegram_init_data:
-        _reject_unauthenticated()
+        _reject_unauthenticated(request)
     if not settings.bot_token:
         # Cannot validate without the bot token — treated as not configured.
         raise HTTPException(status_code=503, detail={"error": "not_configured"})
     try:
         p = verify_init_data(x_telegram_init_data, settings.bot_token)
     except InitDataError:
-        _reject_unauthenticated()
+        _reject_unauthenticated(request)
     try:
         user = json.loads(p["user"])
         tg_id = int(user["id"])
     except (KeyError, ValueError, TypeError, json.JSONDecodeError):
-        _reject_unauthenticated()
+        _reject_unauthenticated(request)
     return {
         "tg_id": tg_id,
         "user": user,
