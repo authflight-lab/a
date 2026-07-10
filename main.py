@@ -821,6 +821,28 @@ async def vip_claim(kind: str, user: dict = Depends(require_user)):
 # Leaderboard / history
 # ---------------------------------------------------------------------------
 
+async def _decorate_vip_levels(
+    rows: list[dict], tg_id: int, you: dict | None = None
+) -> None:
+    """Attach ``vip_level`` to each leaderboard row (and the caller's own row).
+
+    Unregistered users ("not signed up") always render as unranked (level 0),
+    even if a stray vip_state row exists — the client shows the unranked badge
+    for both level 0 and unregistered."""
+    ids = [r["tg_id"] for r in rows if r.get("tg_id") is not None]
+    if you is not None:
+        ids.append(tg_id)
+    if not ids:
+        return
+    levels = await db.vip_levels(ids)
+    reg = await db.registered_ids(ids)
+    for r in rows:
+        uid = r.get("tg_id")
+        r["vip_level"] = levels.get(uid, 0) if uid in reg else 0
+    if you is not None:
+        you["vip_level"] = levels.get(tg_id, 0) if tg_id in reg else 0
+
+
 async def _rows_from_totals(
     totals: dict[int, int], tg_id: int, limit: int = 20
 ) -> tuple[list[dict], dict | None]:
@@ -869,6 +891,7 @@ async def leaderboard(
             if u is not None and u.get("started_at") and not u.get("is_dev"):
                 bal = int(u.get("balance", 0))
                 you = {"rank": await db.rich_rank(tg_id, bal), "value": bal}
+            await _decorate_vip_levels(rows, tg_id, you)
             return {"tab": tab, "period": period, "rows": rows, "you": you}
 
         # Weekly rich = net points gained this week (sum of all ledger amounts),
@@ -893,6 +916,7 @@ async def leaderboard(
                 totals = {uid: v for uid, v in totals.items() if uid not in devs}
             cache.put(cache_key, totals, db._LB_CACHE_TTL)
         rows, you = await _rows_from_totals(totals, tg_id)
+        await _decorate_vip_levels(rows, tg_id, you)
         return {"tab": tab, "period": period, "rows": rows, "you": you,
                 "resets_at": _week_reset_at()}
 
@@ -909,6 +933,7 @@ async def leaderboard(
             continue
         totals[uid] += int(row["count"])
     rows, you = await _rows_from_totals(totals, tg_id)
+    await _decorate_vip_levels(rows, tg_id, you)
     resp = {"tab": tab, "period": period, "rows": rows, "you": you}
     if period == "weekly":
         resp["resets_at"] = _week_reset_at()

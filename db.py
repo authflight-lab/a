@@ -1513,6 +1513,37 @@ async def display_names(tg_ids: list[int]) -> dict[int, str]:
         raise
 
 
+async def _vip_levels_rest(uniq: list[int]) -> dict[int, int]:
+    out: dict[int, int] = {}
+    for i in range(0, len(uniq), 150):
+        chunk = ",".join(str(x) for x in uniq[i:i + 150])
+        rows = await _get("vip_state",
+                          {"select": "tg_id,current_level", "tg_id": f"in.({chunk})"})
+        for r in rows:
+            out[int(r["tg_id"])] = int(r.get("current_level") or 0)
+    return out
+
+
+async def vip_levels(tg_ids: list[int]) -> dict[int, int]:
+    """``{tg_id: current_level}`` for the given users (missing → absent, treat
+    as level 0). Used to render each leaderboard row with the player's VIP rank
+    badge. Direct-DB (one ANY() query), REST fallback (chunked)."""
+    uniq = list({int(i) for i in tg_ids})
+    if not uniq:
+        return {}
+    try:
+        pool = await pgpool.get_pool()
+        recs = await pool.fetch(
+            "select tg_id, current_level from vip_state "
+            "where tg_id = any($1::bigint[])",
+            uniq)
+        return {int(r["tg_id"]): int(r["current_level"] or 0) for r in recs}
+    except Exception as e:  # noqa: BLE001
+        if pgpool.should_fallback(e):
+            return await _vip_levels_rest(uniq)
+        raise
+
+
 async def _registered_ids_rest(uniq: list[int]) -> set[int]:
     # Batched to stay well under PostgREST URL-length limits on large weeks.
     out: set[int] = set()
