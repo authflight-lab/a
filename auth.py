@@ -11,7 +11,7 @@ import json
 import time
 from urllib.parse import parse_qsl
 
-from fastapi import Header, HTTPException, Request
+from fastapi import Header, HTTPException
 
 from . import ratelimit
 from .config import settings
@@ -21,29 +21,38 @@ class InitDataError(Exception):
     """Raised when initData fails HMAC validation or is stale."""
 
 
-def _client_ip(request: Request | None) -> str:
-    """Same IP-extraction rule as the pre-auth IP middleware (main.py)."""
-    if request is None:
-        return "unknown"
-    xff = request.headers.get("X-Forwarded-For")
-    if xff:
-        return xff.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+def _fail_key(init_data: str | None) -> str:
+    """Bucket key for a failed-auth attempt.
+
+    IP is useless here: we sit behind Cloudflare Workers, where many distinct
+    users share the same edge IP, so an IP-keyed budget would let one user's
+    failures 429-block everyone else's fresh logins. Instead we key on the
+    literal credential that failed (a hash of the raw initData string, or a
+    fixed sentinel when the header is missing entirely). A *retry* — the
+    client resending the same bad/stale initData — hits the same bucket and
+    eventually gets 429. A genuinely new login attempt (different initData,
+    e.g. the user re-opening the Telegram webapp to mint a fresh one) is a
+    different key and is judged fresh, and a VALID initData never reaches
+    this function at all, so real success is never rate-limited.
+    """
+    if not init_data:
+        return "401:missing"
+    return "401:" + hashlib.sha256(init_data.encode()).hexdigest()
 
 
-def _reject_unauthenticated(request: Request | None = None):
-    """Raise 429 once THIS caller's failed-auth budget is spent, else raise 401.
+def _reject_unauthenticated(init_data: str | None = None):
+    """Raise 429 once THIS credential's retry budget is spent, else raise 401.
 
     A 401 is rejected before any of the app's own UI pacing ever applies (no
     button tap, no poll interval, nothing) — unlike every other status code,
     an external caller hitting the API directly can trigger 401s as fast as
-    the network allows. The budget is per-IP (config bt_rl_auth_fail_*): once
-    one caller's own failures exhaust it, THEIR further retries get 429
-    instead of a fresh 401 — but this must never cap out other users' ability
-    to log in, so it is keyed per source IP, not shared globally.
+    the network allows. The budget (config bt_rl_auth_fail_*) is keyed per
+    failing credential (see ``_fail_key``): once retries of the SAME bad
+    initData exhaust it, further identical retries get 429 instead of a fresh
+    401 — but a valid login, or a different login attempt, is never affected.
     """
     allowed, retry_after = ratelimit.check(
-        f"401:{_client_ip(request)}", limit=settings.bt_rl_auth_fail_limit, window_sec=settings.bt_rl_auth_fail_window_sec
+        _fail_key(init_data), limit=settings.bt_rl_auth_fail_limit, window_sec=settings.bt_rl_auth_fail_window_sec
     )
     if not allowed:
         raise HTTPException(
@@ -89,7 +98,6 @@ def resolve_display_name(user: dict, tg_id: int | None = None) -> str:
 
 
 async def require_user(
-    request: Request,
     x_telegram_init_data: str | None = Header(default=None, alias="X-Telegram-Init-Data"),
 ) -> dict:
     """FastAPI dependency: validate initData, return ``{"tg_id", "user"}``.
@@ -97,19 +105,19 @@ async def require_user(
     ``tg_id`` is taken exclusively from the validated ``initData.user`` payload.
     """
     if not x_telegram_init_data:
-        _reject_unauthenticated(request)
+        _reject_unauthenticated(x_telegram_init_data)
     if not settings.bot_token:
         # Cannot validate without the bot token — treated as not configured.
         raise HTTPException(status_code=503, detail={"error": "not_configured"})
     try:
         p = verify_init_data(x_telegram_init_data, settings.bot_token)
     except InitDataError:
-        _reject_unauthenticated(request)
+        _reject_unauthenticated(x_telegram_init_data)
     try:
         user = json.loads(p["user"])
         tg_id = int(user["id"])
     except (KeyError, ValueError, TypeError, json.JSONDecodeError):
-        _reject_unauthenticated(request)
+        _reject_unauthenticated(x_telegram_init_data)
     return {
         "tg_id": tg_id,
         "user": user,
