@@ -523,9 +523,12 @@ async def vip_get(tg_id: int) -> dict:
     try:
         pool = await pgpool.get_pool()
         st = await pool.fetchrow(
-            "select total_msgs, total_wagered, current_level, "
-            "unclaimed_rakeback, week_wagered, month_wagered, "
-            "weekly_claimed_at, monthly_claimed_at from vip_state where tg_id = $1",
+            "select "
+            "  coalesce((select sum(count)::bigint from bt_chat_counts where tg_id = $1), 0) as total_msgs, "
+            "  total_wagered, current_level, "
+            "  unclaimed_rakeback, week_wagered, month_wagered, "
+            "  weekly_claimed_at, monthly_claimed_at "
+            "from vip_state where tg_id = $1",
             tg_id)
         tiers = await pool.fetch(
             "select level, name, req_msgs, req_wagered, "
@@ -537,8 +540,10 @@ async def vip_get(tg_id: int) -> dict:
         if not pgpool.should_fallback(e):
             raise
     st_rows = await _get("vip_state", {"tg_id": f"eq.{tg_id}", "select": "*", "limit": "1"})
+    cnt_rows = await _get("bt_chat_counts", {"tg_id": f"eq.{tg_id}", "select": "count", "limit": "100000"})
     tier_rows = await _get("vip_tiers", {"select": "*", "order": "level.asc"})
-    state = st_rows[0] if st_rows else dict(_VIP_STATE_DEFAULT)
+    state = dict(st_rows[0]) if st_rows else dict(_VIP_STATE_DEFAULT)
+    state["total_msgs"] = sum(int(r.get("count", 0) or 0) for r in cnt_rows)
     return {"state": _vip_state_out(state), "tiers": [_vip_tier_out(t) for t in tier_rows]}
 
 
