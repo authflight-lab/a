@@ -509,6 +509,17 @@ async def me(user: dict = Depends(require_user)):
     }
 
 
+@app.get("/bt/api/stats/series")
+async def stats_series(user: dict = Depends(require_user)):
+    """7-day daily message + wagered series for the home stats-card charts."""
+    tg_id = user["tg_id"]
+    try:
+        return await db.stats_series_7d(tg_id)
+    except Exception:  # noqa: BLE001
+        logging.exception("stats_series failed for %s", tg_id)
+        return {"days": [], "messages": [], "wagered": []}
+
+
 @app.post("/bt/api/backlog/claim")
 async def backlog_claim(user: dict = Depends(require_user)):
     tg_id = user["tg_id"]

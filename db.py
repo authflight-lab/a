@@ -1218,6 +1218,78 @@ async def user_stats(tg_id: int) -> dict:
     return out
 
 
+async def stats_series_7d(tg_id: int) -> dict:
+    """7-day daily series for the home stats-card charts.
+
+    Returns ``{days, messages, wagered}`` — three parallel lists of exactly 7
+    entries, oldest→newest. ``messages`` are per-day counts from
+    ``bt_chat_counts``; ``wagered`` is the per-day sum of ``|game_bet|`` ledger
+    amounts (the same source as ``amount_wagered`` on the card). Pool-first with
+    a REST fallback; both paths zero-fill missing days so the chart is always a
+    dense 7-point series.
+    """
+    today = datetime.now(timezone.utc).date()
+    start = today - timedelta(days=6)
+    days = [(start + timedelta(days=i)).isoformat() for i in range(7)]
+    msgs = {d: 0 for d in days}
+    wag = {d: 0 for d in days}
+    start_dt = datetime(start.year, start.month, start.day, tzinfo=timezone.utc)
+    try:
+        pool = await pgpool.get_pool()
+        mrecs = await pool.fetch(
+            "select day::text as d, sum(count)::bigint as c "
+            "from bt_chat_counts where tg_id = $1 and day >= $2 group by day",
+            tg_id, start)
+        for r in mrecs:
+            if r["d"] in msgs:
+                msgs[r["d"]] = int(r["c"] or 0)
+        wrecs = await pool.fetch(
+            "select (created_at at time zone 'utc')::date::text as d, "
+            "coalesce(sum(abs(amount)), 0)::bigint as w "
+            "from bt_ledger where tg_id = $1 and kind = 'game_bet' "
+            "and created_at >= $2 group by 1",
+            tg_id, start_dt)
+        for r in wrecs:
+            if r["d"] in wag:
+                wag[r["d"]] = int(r["w"] or 0)
+    except Exception as e:  # noqa: BLE001
+        if not pgpool.should_fallback(e):
+            raise
+        m_rows = await _get(
+            "bt_chat_counts",
+            {"tg_id": f"eq.{tg_id}", "day": f"gte.{start.isoformat()}",
+             "select": "day,count", "limit": "100000"})
+        for r in m_rows:
+            d = str(r.get("day", ""))[:10]
+            if d in msgs:
+                msgs[d] += int(r.get("count", 0) or 0)
+        l_rows = await _get(
+            "bt_ledger",
+            {"tg_id": f"eq.{tg_id}", "kind": "eq.game_bet",
+             "created_at": f"gte.{start_dt.isoformat()}",
+             "select": "amount,created_at", "limit": "100000"})
+        for r in l_rows:
+            # Normalise created_at (timestamptz) to a UTC calendar day so the
+            # fallback buckets identically to the pool path's
+            # ``(created_at at time zone 'utc')::date`` — a naive string slice
+            # would misbucket rows carrying a non-UTC offset near midnight.
+            raw = str(r.get("created_at", ""))
+            try:
+                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                d = dt.astimezone(timezone.utc).date().isoformat()
+            except ValueError:
+                d = raw[:10]
+            if d in wag:
+                wag[d] += abs(int(r.get("amount", 0) or 0))
+    return {
+        "days": days,
+        "messages": [msgs[d] for d in days],
+        "wagered": [wag[d] for d in days],
+    }
+
+
 async def claim_backlog(tg_id: int) -> dict:
     """Atomically credit 75% of the user's backlog and clear it.
 
