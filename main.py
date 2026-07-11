@@ -774,7 +774,7 @@ async def _decorate_vip_levels(
 
 
 async def _rows_from_totals(
-    totals: dict[int, int], tg_id: int, limit: int = 20
+    totals: dict[int, int], tg_id: int, limit: int = 10
 ) -> tuple[list[dict], dict | None]:
     """Build ranked rows + the caller's own position from a {tg_id: value} map."""
     ordered = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
@@ -807,7 +807,7 @@ async def leaderboard(
     if tab == "rich":
         if period == "alltime":
             # All-time rich list = current balances.
-            top = await db.leaderboard_rich(limit=20)
+            top = await db.leaderboard_rich(limit=10)
             rows = [
                 {"rank": i + 1, "tg_id": int(r["tg_id"]),
                  "display_name": r.get("display_name") or str(r["tg_id"]),

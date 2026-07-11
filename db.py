@@ -1090,14 +1090,14 @@ async def rounds_history(tg_id: int, limit: int = 50) -> list[dict]:
                        "order": "created_at.desc", "limit": str(limit)})
 
 
-async def _leaderboard_rich_rest(limit: int = 20) -> list[dict]:
+async def _leaderboard_rich_rest(limit: int = 10) -> list[dict]:
     return await _get("bt_users",
                       {"select": "tg_id,display_name,balance",
                        "order": "balance.desc", "limit": str(limit),
                        "started_at": "not.is.null", "is_dev": "is.false"})
 
 
-async def leaderboard_rich(limit: int = 20) -> list[dict]:
+async def leaderboard_rich(limit: int = 10) -> list[dict]:
     """Top registered, non-dev balances (direct-DB, REST fallback), cached
     briefly: the whole board is shared by every caller and the
     bt_users_balance_idx read is pointless to repeat 20x/minute per user."""
