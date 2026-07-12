@@ -810,10 +810,22 @@ async def leaderboard(
     allowed, retry_after = ratelimit.check(f"leaderboard:{tg_id}", limit=settings.bt_rl_read_limit, window_sec=settings.bt_rl_read_window_sec)
     if not allowed:
         return _rl_err(retry_after)
-    if tab not in ("rich", "chatters"):
+    if tab not in ("rich", "chatters", "streak"):
         return _err("invalid_tab")
     if period not in ("weekly", "alltime"):
         period = "weekly"
+
+    if tab == "streak":
+        # Longest CURRENT consecutive-day chat streak (a day counts if the user
+        # sent >=1 message). Period-agnostic: the same live streak is returned
+        # for either toggle. Includes everyone (like Chatters); devs excluded.
+        streaks = await db.leaderboard_streak()
+        devs = await db.dev_ids_all()
+        totals = {int(r["tg_id"]): int(r["streak"])
+                  for r in streaks if int(r["tg_id"]) not in devs}
+        rows, you = await _rows_from_totals(totals, tg_id)
+        await _decorate_vip_levels(rows, tg_id, you)
+        return {"tab": tab, "period": period, "rows": rows, "you": you}
 
     if tab == "rich":
         if period == "alltime":
