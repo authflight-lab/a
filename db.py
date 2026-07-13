@@ -1347,57 +1347,6 @@ async def chat_counts_since(start_day: str) -> list[dict]:
     return rows
 
 
-async def leaderboard_streak() -> list[dict]:
-    """Current consecutive-day chat streaks, as ``[{tg_id, streak}]`` for every
-    user whose streak is still alive (they sent a message today or yesterday,
-    UTC).
-
-    A "streak day" is any UTC day the user sent at least one message (i.e. a
-    bt_chat_counts row exists for that day, in any chat). The streak is the
-    length of the consecutive-day run ending on their most-recent active day; a
-    missed day resets it. Derived entirely from bt_chat_counts via gaps-and-
-    islands, so there is no stored column to maintain and nothing added to the
-    chat hot path.
-
-    Returns EVERY alive streak (not just a top slice) so the caller can also
-    compute its own "you" position. Only the run ending today/yesterday can pass
-    the alive filter, so each tg_id appears once. Direct-DB only: the gaps-and-
-    islands aggregation has no clean REST form, so pool failures propagate
-    rather than serve a wrong board. Cached briefly — the board is shared."""
-    key = "lb:streak"
-    hit = cache.get(key)
-    if hit is not None:
-        return hit
-    pool = await pgpool.get_pool()
-    recs = await pool.fetch(
-        """
-        with days as (
-            select distinct tg_id, day from bt_chat_counts
-        ),
-        islands as (
-            select tg_id, day,
-                   day - (row_number() over (
-                       partition by tg_id order by day))::int as run_key
-            from days
-        ),
-        runs as (
-            select tg_id, count(*)::int as streak, max(day) as last_day
-            from islands
-            group by tg_id, run_key
-        )
-        select tg_id, streak from runs
-        -- Alive = active today or yesterday. Compare against the UTC date
-        -- explicitly (bt_chat_counts.day is a UTC date), not current_date,
-        -- so liveness never depends on the DB session timezone.
-        where last_day >= (now() at time zone 'utc')::date - 1
-        order by streak desc
-        """
-    )
-    rows = [_row(r) for r in recs]
-    cache.put(key, rows, _LB_CACHE_TTL)
-    return rows
-
-
 async def ledger_totals_since(
     start: str, exclude_kind: str | None = None
 ) -> dict[int, int]:
