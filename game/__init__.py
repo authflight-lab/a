@@ -13,7 +13,14 @@ Global constants (spec §6):
 """
 
 EPS = 0.02
-P_MAX = 2000
+# Absolute per-round payout ceiling (points). This is ONLY a last-resort backstop
+# against a mispriced/bugged multiplier — the real economy guard is each game's
+# own multiplier cap (MULT_CAP=25, rps 20, chicken 24, keno's paytable). It must
+# sit ABOVE the largest LEGITIMATE single-round win or it silently clips real
+# payouts: at BET_MAX=500 that peak is keno's ~105x top row (~52,480 pts). An
+# earlier value of 2000 capped every max-bet win at 4x — towers showing 7.45x or
+# keno 23.09x still only paid 2000 — so keep this comfortably above the real max.
+P_MAX = 100000
 # Hard ceiling on any game's win multiplier, so an open-ended progression
 # (towers doubling, mines deep-clears, highlow chaining) can't balloon a single
 # round far beyond the point-earning economy. A capped step auto-cashes out.

@@ -347,7 +347,9 @@ def _daily_claim(streak: int) -> int:
 def _payout(bet: int, multiplier: float) -> int:
     """bet * multiplier, rounded to the nearest integer (half rounds up so a
     payout of exactly x.50 always rounds up, not Python's banker's rounding),
-    capped at P_MAX (spec §6)."""
+    capped at P_MAX. P_MAX is only a last-resort backstop against a bugged
+    multiplier — it sits above the largest legitimate single-round win, so real
+    wins (towers 7.45x, keno up to ~105x, etc.) are paid in full, never clipped."""
     return min(math.floor(bet * multiplier + 0.5), P_MAX)
 
 
@@ -1602,8 +1604,17 @@ async def game_step(name: str, user: dict = Depends(require_user), body: dict | 
             return {"outcome_step": outcome, "multiplier": 0.0, "can_cashout": False,
                     "busted": True, "done": True, **final}
         new_streak = streak + 1
-        mult = flip.multiplier(new_streak)
+        raw = flip.multiplier(new_streak)
+        mult = min(raw, MULT_CAP)
         new_state = {"streak": new_streak, "multiplier": mult, "coin": coin, "guess": guess}
+        # Auto-cash once the cap is reached: flip has no natural terminal (a
+        # streak can grow forever), so without this its 1.96^streak ladder would
+        # run past the economy — the same guard mines/towers apply.
+        if raw >= MULT_CAP:
+            outcome = {**new_state, "cleared": True}
+            final = await _finalise(rnd, tg_id, mult, "cashed_out", outcome)
+            return {"outcome_step": {"coin": coin, "guess": guess, "streak": new_streak},
+                    "multiplier": mult, "can_cashout": True, "busted": False, "done": True, **final}
         if not await _persist_step(rnd, new_state):
             return _err("round_not_open")
         return {"outcome_step": {"coin": coin, "guess": guess, "streak": new_streak},
@@ -1951,7 +1962,7 @@ async def game_cashout(name: str, user: dict = Depends(require_user), body: dict
     ss, cs, nonce = rnd["server_seed"], rnd["client_seed"], int(rnd["nonce"])
     if name == "flip":
         streak = int(state.get("streak", 0))
-        mult = flip.multiplier(streak)
+        mult = min(flip.multiplier(streak), MULT_CAP)
         outcome = {"streak": streak, "multiplier": mult}
     elif name == "mines":
         m = int(params["mines"])
